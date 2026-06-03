@@ -1,0 +1,99 @@
+{
+    "enabled": true,
+    "default_preset": "合约攻略",
+    "presets": [
+        {
+            "name": "极简",
+            "fields": [
+                {
+                    "label": "名称",
+                    "hint": "",
+                    "default": "",
+                    "allow_empty": false
+                },
+                {
+                    "label": "轨道数",
+                    "hint": "",
+                    "default": "AUTO_TRACKS",
+                    "allow_empty": true
+                },
+                {
+                    "label": "时间戳",
+                    "hint": "",
+                    "default": "AUTO_TIMESTAMP",
+                    "allow_empty": false
+                }
+            ]
+        },
+        {
+            "name": "日常少人",
+            "fields": [
+                {
+                    "label": "活动名称",
+                    "hint": "",
+                    "default": "",
+                    "allow_empty": false
+                },
+                {
+                    "label": "流派",
+                    "hint": "常规队、自忍等",
+                    "default": "",
+                    "allow_empty": true
+                },
+                {
+                    "label": "轨道数",
+                    "hint": "",
+                    "default": "AUTO_TRACKS",
+                    "allow_empty": true
+                },
+                {
+                    "label": "时间戳",
+                    "hint": "",
+                    "default": "AUTO_TIMESTAMP",
+                    "allow_empty": false
+                }
+            ]
+        },
+        {
+            "name": "合约攻略",
+            "fields": [
+                {
+                    "label": "合约编号",
+                    "hint": "#5即第五次合约",
+                    "default": "#5",
+                    "allow_empty": false
+                },
+                {
+                    "label": "分数",
+                    "hint": "",
+                    "default": "799",
+                    "allow_empty": false
+                },
+                {
+                    "label": "打法",
+                    "hint": "C永控解，K强杀解",
+                    "default": "C",
+                    "allow_empty": false
+                },
+                {
+                    "label": "编队编号",
+                    "hint": "",
+                    "default": "",
+                    "allow_empty": false
+                },
+                {
+                    "label": "轨道数",
+                    "hint": "",
+                    "default": "AUTO_TRACKS",
+                    "allow_empty": true
+                },
+                {
+                    "label": "时间戳",
+                    "hint": "",
+                    "default": "AUTO_TIMESTAMP",
+                    "allow_empty": false
+                }
+            ]
+        }
+    ]
+}
