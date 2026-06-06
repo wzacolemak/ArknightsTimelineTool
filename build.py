@@ -93,6 +93,51 @@ def build_exe(source_dir, name, debug=False, uac_admin=False):
     print(f"[成功] {name} 打包完成。")
 
 
+def build_tools(target_dir):
+    """将小工具目录下的 Python 脚本打包为独立 exe。"""
+    tools_src = os.path.join(BASE_DIR, "小工具")
+    if not os.path.exists(tools_src):
+        return []
+
+    tools_dst = os.path.join(target_dir, "小工具")
+    os.makedirs(tools_dst, exist_ok=True)
+    built_names = []
+
+    for py_file in os.listdir(tools_src):
+        if not py_file.endswith(".py"):
+            continue
+        py_path = os.path.join(tools_src, py_file)
+        name = os.path.splitext(py_file)[0]
+
+        # spec 文件放到 BUILD_DIR 下统一清理
+        spec_dir = os.path.join(BUILD_DIR, "tool_specs")
+        os.makedirs(spec_dir, exist_ok=True)
+
+        cmd = [
+            sys.executable, "-m", "PyInstaller",
+            "--onefile",
+            "--noconsole",
+            "--name", name,
+            "--distpath", tools_dst,
+            "--workpath", BUILD_DIR,
+            "--specpath", spec_dir,
+            "--clean",
+            py_path,
+        ]
+
+        print(f"\n{'='*60}")
+        print(f"正在打包小工具: {name}")
+        print(f"{'='*60}")
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"[错误] 打包小工具 {name} 失败！")
+        else:
+            print(f"[成功] 小工具 {name} 打包完成。")
+            built_names.append(name)
+
+    return built_names
+
+
 def copy_extra_files(target_dir):
     """
     复制外部资源文件到输出目录（exe 同级）。
@@ -171,6 +216,10 @@ def package_version(folder_name, ruler_name, timeline_name, debug=False):
             print(f"  移动: {name} -> {folder_name}/")
         else:
             print(f"  警告: 未找到 {name}")
+
+    # 打包小工具为独立 exe
+    print(f"\n打包小工具到 {folder_name}/ ...")
+    build_tools(version_dir)
 
     # 复制外部资源
     print(f"\n复制外部资源到 {folder_name}/ ...")

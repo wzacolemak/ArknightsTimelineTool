@@ -24,6 +24,7 @@ class TimelineTrack:
         self.mode = tk.StringVar(value="打轴模式")
         self.magnet_mode = tk.BooleanVar(value=True)
         self.magnet_locked = False  # 尺子时间流动时锁定吸附，禁止拖拽解除
+        self.track_zoom = 1.0  # 单轨道缩放比例
         self.sound_alert_enabled = tk.BooleanVar(value=True)
         self.visual_alert_enabled = tk.BooleanVar(value=True)
         self.alert_lead_frames = {"sound": 60, "visual": 60}
@@ -72,7 +73,7 @@ class TimelineTrack:
         self.info_frame.columnconfigure(2, weight=1)  # 名称列自动扩展
         # 为预告列保留最小宽度，确保不会被前面的长名称完全挤出
         min_rem_width = max(80, int(60 * self.app.scaling_factor))
-        self.info_frame.columnconfigure(3, minsize=min_rem_width)
+        self.info_frame.columnconfigure(5, minsize=min_rem_width)
 
         self.info_time_label = ttk.Label(self.info_frame, text="00:00:00", style="Info.TLabel",
                                          font=(config.FONT_FAMILY, self.app.scaled_font_large, "bold"))
@@ -86,8 +87,17 @@ class TimelineTrack:
         self.info_name_label.grid(row=0, column=2, sticky="w", padx=(0, self.app.scaled_pad_m))
         self.info_name_label.bind("<Button-1>", self._on_node_name_click)
 
+        # 节点跳转按钮
+        self.prev_node_btn = ttk.Label(self.info_frame, text="◀", style="Info.TLabel", cursor="hand2")
+        self.prev_node_btn.grid(row=0, column=3, sticky="e", padx=(0, self.app.scaled_pad_s))
+        self.prev_node_btn.bind("<Button-1>", self._on_prev_node_click)
+
+        self.next_node_btn = ttk.Label(self.info_frame, text="▶", style="Info.TLabel", cursor="hand2")
+        self.next_node_btn.grid(row=0, column=4, sticky="e", padx=(0, self.app.scaled_pad_s))
+        self.next_node_btn.bind("<Button-1>", self._on_next_node_click)
+
         self.info_remaining_label = ttk.Label(self.info_frame, text="", style="Info.TLabel")
-        self.info_remaining_label.grid(row=0, column=3, sticky="e", padx=self.app.scaled_pad_m)
+        self.info_remaining_label.grid(row=0, column=5, sticky="e", padx=self.app.scaled_pad_m)
 
         # --- Canvas（最后 pack，expand=True 填满 title_bar 和 info_frame 之间的剩余空间） ---
         self.canvas = tk.Canvas(self.frame, bg="#21252b", highlightthickness=0)
@@ -145,7 +155,7 @@ class TimelineTrack:
         if width <= 1 or height <= 1:
             return
 
-        pixels_per_frame = self.app.scaled_pixels_per_frame
+        pixels_per_frame = self.app.scaled_pixels_per_frame * self.track_zoom
 
         # 根据轨道 frame 高度计算紧凑级别
         track_h = self.frame.winfo_height()
@@ -243,6 +253,14 @@ class TimelineTrack:
 
         # 打轴模式下动态更新添加/删除按钮图标（由 app 负责，但这里提供状态）
         self.node_on_cursor = node_on_cursor
+
+        # 节点跳转按钮状态：时间流逝时置灰禁用
+        if self.app.is_time_flowing:
+            self.prev_node_btn.config(foreground="#5c6370", cursor="")
+            self.next_node_btn.config(foreground="#5c6370", cursor="")
+        else:
+            self.prev_node_btn.config(foreground="#abb2bf", cursor="hand2")
+            self.next_node_btn.config(foreground="#abb2bf", cursor="hand2")
 
     # ------------------------------------------------------------------
     # Drawing
@@ -472,6 +490,34 @@ class TimelineTrack:
             node_to_rename = node_on_cursor if node_on_cursor else self.current_next_node
             if node_to_rename:
                 self._rename_node_logic(node_to_rename)
+
+    def _on_prev_node_click(self, event):
+        """跳转到前一个最近的节点（忽略当前所在节点）。"""
+        if self.app.is_time_flowing:
+            return
+        center_frame = self.get_center_frame()
+        candidates = [node for node in self.timeline_data if node['frame'] < center_frame]
+        if not candidates:
+            return
+        target = max(candidates, key=lambda n: n['frame'])
+        self.app._animate_scroll_to(target['frame'])
+        if self.magnet_mode.get():
+            self.magnet_mode.set(False)
+        logger.info(f"[{self.name}] 跳转到上一节点: {target['name']} @ {target['frame']}")
+
+    def _on_next_node_click(self, event):
+        """跳转到后一个最近的节点（忽略当前所在节点）。"""
+        if self.app.is_time_flowing:
+            return
+        center_frame = self.get_center_frame()
+        candidates = [node for node in self.timeline_data if node['frame'] > center_frame]
+        if not candidates:
+            return
+        target = min(candidates, key=lambda n: n['frame'])
+        self.app._animate_scroll_to(target['frame'])
+        if self.magnet_mode.get():
+            self.magnet_mode.set(False)
+        logger.info(f"[{self.name}] 跳转到下一节点: {target['name']} @ {target['frame']}")
 
     @staticmethod
     def _truncate_node_name(name, max_chars=10):

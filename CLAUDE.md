@@ -314,3 +314,39 @@ timeline_tool/
 46. **窗口高度自动调整增大** — `app.py`
     - 需求：新建/删除轨道时自动计算的窗口高度偏小，内容显示拥挤
     - 修改：`_adjust_window_height()` 中 `per_track` 从 `90` 增至 `120`，`ops_min_h` 从 `80` 增至 `100`，给轨道内容（title_bar + canvas + info_frame）留出更充裕的垂直空间
+
+### 2026-06-06 — 节点跳转 + 比例尺缩放 + 小工具
+
+47. **节点跳转按钮** — `timeline_track.py`
+    - 在每个轨道的 `info_frame` 中，`info_remaining_label` 左侧新增 `◀`/`▶` 跳转按钮
+    - 当费用尺时间不在流逝时（`is_time_flowing=False`），点击左箭头跳转到前一个最近的节点，点击右箭头跳转到后一个最近的节点
+    - 若当前正好处在一个节点上，该节点会被自然忽略（`frame < center_frame` 或 `frame > center_frame`）
+    - 时间流逝时按钮置灰（`foreground="#5c6370"`），点击无反应，与强制吸附同一逻辑
+    - 跳转后自动解除当前轨道的磁铁吸附，避免立即被拉回
+
+48. **比例尺缩放** — `timeline_track.py` + `app.py` + `config.py`
+    - 全局缩放：`app.global_zoom`，作用于所有轨道的基础 `pixels_per_frame`
+    - 单轨道缩放：`track.track_zoom`，每个轨道独立，实际像素 = `global_zoom * track_zoom * PIXELS_PER_FRAME`
+    - 键盘绑定：
+      - `Ctrl+↑`/`Ctrl+↓`：统一调整所有轨道的全局缩放（步进 `0.1`，范围 `0.2~5.0`）
+      - `↑`/`↓`：调整当前激活轨道的单轨道缩放（步进 `0.1`，范围相同）
+      - `←`/`→`：向左/向右移动时间轴（步进 `30` 帧）
+    - 费用尺时间流逝时禁止所有缩放和移动操作
+    - 拖拽、惯性滚动、单击吸附等交互均自动适配单轨道缩放比例
+    - 新增配置常量：`MIN_ZOOM`、`MAX_ZOOM`、`KEYBOARD_SCROLL_STEP`
+
+49. **JSON↔Excel 小工具** — 新增 `小工具/json_to_excel.py`、`小工具/excel_to_json.py`
+    - `json_to_excel.py`：弹出对话框选择 JSON 轴文件，生成同名 `.xlsx`
+      - Sheet `时间轴`：第一列为帧数，第二列为 `MM:SS:FF` 格式时间，后续每列对应一个轨道，单元格为该帧的节点名称
+      - Sheet `设置`：包含版本信息及各轨道的模式、磁铁、提醒开关、提前帧数等设置
+    - `excel_to_json.py`：弹出对话框选择 Excel 文件，读取上述两表结构，还原为多轨道 JSON
+      - 支持 `MM:SS:FF` 和纯帧数两种时间解析方式
+      - 颜色按默认轮询分配
+    - 打包时通过 `build.py:copy_extra_files()` 将 `小工具/` 目录复制到 exe 同级，方便用户直接使用
+
+### 文件约定
+
+- 代码注释和文档使用中文
+- 日志输出使用中文
+- 变量名、函数名使用英文
+- 所有图标来自 Google Material Symbols

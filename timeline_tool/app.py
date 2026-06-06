@@ -104,6 +104,7 @@ class TimelineApp:
 
         # --- 基于缩放比例计算所有UI尺寸 ---
         self.scaling_factor = scaling_factor
+        self.global_zoom = 1.0
         self._calculate_scaled_dimensions()
 
         self._configure_root_window()
@@ -145,10 +146,12 @@ class TimelineApp:
 
         # --- WebSocket 时间流逝跟踪（用于磁铁吸附锁定） ---
         self._last_game_frame = -1
+        self._is_time_flowing = False
 
         # --- UI设置与启动 ---
         self._setup_styles()
         self._setup_ui()
+        self._setup_keybindings()
 
         if open_file and os.path.exists(open_file):
             # 重启后重新打开原文件
@@ -175,7 +178,7 @@ class TimelineApp:
         self.scaled_icon_size = (int(config.ICON_SIZE[0] * sf), int(config.ICON_SIZE[1] * sf))
 
         # 时间轴与节点尺寸
-        self.scaled_pixels_per_frame = config.PIXELS_PER_FRAME * sf
+        self.scaled_pixels_per_frame = config.PIXELS_PER_FRAME * sf * self.global_zoom
         self.scaled_node_diamond_h = int(config.NODE_DIAMOND_SIZE["h"] * sf)
         self.scaled_node_diamond_w = int(config.NODE_DIAMOND_SIZE["w"] * sf)
         self.scaled_track_height = int(config.TIMELINE_TRACK_HEIGHT * sf)
@@ -535,6 +538,7 @@ class TimelineApp:
 
                     if current_frame > self._last_game_frame:
                         # 时间正在流逝：对轴轨道强制吸附并锁定
+                        self._is_time_flowing = True
                         for track in self.tracks:
                             if track.mode.get() == "对轴模式":
                                 if not track.magnet_mode.get():
@@ -543,6 +547,7 @@ class TimelineApp:
                                 track.magnet_locked = True
                     elif current_frame == self._last_game_frame:
                         # 时间暂停了（isRunning=True 但帧数没增加）
+                        self._is_time_flowing = False
                         for track in self.tracks:
                             if getattr(track, 'magnet_locked', False):
                                 track.magnet_locked = False
@@ -551,6 +556,7 @@ class TimelineApp:
                     self._last_game_frame = current_frame
                 else:
                     # 尺子未运行：解除锁定并重置帧数跟踪
+                    self._is_time_flowing = False
                     for track in self.tracks:
                         if getattr(track, 'magnet_locked', False):
                             track.magnet_locked = False
@@ -591,6 +597,79 @@ class TimelineApp:
                 self.add_remove_btn.config(image=icon)
             if hasattr(self.add_remove_btn, '_tooltip'):
                 self.add_remove_btn._tooltip.set_text(text)
+
+    def _setup_keybindings(self):
+        """绑定键盘事件：缩放与移动。"""
+        self.root.bind("<Up>", self._on_key_up)
+        self.root.bind("<Down>", self._on_key_down)
+        self.root.bind("<Left>", self._on_key_left)
+        self.root.bind("<Right>", self._on_key_right)
+
+    def _on_key_up(self, event):
+        """上箭头：单轨道缩放增大；Ctrl+上箭头：全局缩放增大。"""
+        if self.is_time_flowing:
+            return
+        if event.state & 0x0004:  # Ctrl 按下
+            self._apply_global_zoom(0.1)
+        else:
+            self._apply_track_zoom(0.1)
+
+    def _on_key_down(self, event):
+        """下箭头：单轨道缩放减小；Ctrl+下箭头：全局缩放减小。"""
+        if self.is_time_flowing:
+            return
+        if event.state & 0x0004:  # Ctrl 按下
+            self._apply_global_zoom(-0.1)
+        else:
+            self._apply_track_zoom(-0.1)
+
+    def _on_key_left(self, event):
+        """左箭头：向左移动时间轴；若处于吸附状态则自动解除。"""
+        if self.is_time_flowing:
+            return
+        active = self.active_track
+        if active and active.magnet_mode.get():
+            active.magnet_mode.set(False)
+            logger.info("通过左箭头键解除磁铁吸附。")
+        self.timeline_offset -= config.KEYBOARD_SCROLL_STEP
+        self._update_display()
+
+    def _on_key_right(self, event):
+        """右箭头：向右移动时间轴；若处于吸附状态则自动解除。"""
+        if self.is_time_flowing:
+            return
+        active = self.active_track
+        if active and active.magnet_mode.get():
+            active.magnet_mode.set(False)
+            logger.info("通过右箭头键解除磁铁吸附。")
+        self.timeline_offset += config.KEYBOARD_SCROLL_STEP
+        self._update_display()
+
+    def _apply_global_zoom(self, delta):
+        """统一调整所有轨道的缩放比例，使所有轨道倍率完全一致。"""
+        new_zoom = round(self.global_zoom + delta, 1)
+        new_zoom = max(config.MIN_ZOOM, min(config.MAX_ZOOM, new_zoom))
+        if new_zoom != self.global_zoom:
+            self.global_zoom = new_zoom
+            # 只更新全局像素比例，不重置窗口尺寸
+            self.scaled_pixels_per_frame = config.PIXELS_PER_FRAME * self.scaling_factor * self.global_zoom
+            # 统一所有轨道的缩放倍率
+            for track in self.tracks:
+                track.track_zoom = 1.0
+            logger.info(f"全局缩放调整为 {self.global_zoom}x，所有轨道已统一为 1.0x")
+            self._update_display()
+
+    def _apply_track_zoom(self, delta):
+        """调整当前激活轨道的缩放比例。"""
+        active = self.active_track
+        if not active:
+            return
+        new_zoom = round(active.track_zoom + delta, 1)
+        new_zoom = max(config.MIN_ZOOM, min(config.MAX_ZOOM, new_zoom))
+        if new_zoom != active.track_zoom:
+            active.track_zoom = new_zoom
+            logger.info(f"[{active.name}] 轨道缩放调整为 {active.track_zoom}x")
+            self._update_display()
 
     def _update_ui_for_mode(self, *args):
         """根据当前激活轨道的模式更新UI。"""
@@ -634,6 +713,11 @@ class TimelineApp:
         if 0 <= self.active_track_index < len(self.tracks):
             return self.tracks[self.active_track_index]
         return None
+
+    @property
+    def is_time_flowing(self):
+        """费用尺时间是否正在流逝（用于禁止跳转、缩放等操作）。"""
+        return self._is_time_flowing
 
     # ------------------------------------------------------------------
     # Buttons
@@ -779,7 +863,8 @@ class TimelineApp:
 
         dx = event.x - self._timeline_drag_data["x"]
         self._timeline_drag_data["last_dx"] = dx
-        frame_delta = dx / self.scaled_pixels_per_frame if self.scaled_pixels_per_frame else 0
+        effective_ppf = self.scaled_pixels_per_frame * track.track_zoom
+        frame_delta = dx / effective_ppf if effective_ppf else 0
 
         if track.magnet_mode.get():
             # 磁铁锁定时禁止通过拖拽解除吸附
@@ -797,15 +882,16 @@ class TimelineApp:
 
         if was_dragging:
             if not track.magnet_mode.get():
-                self.inertia_velocity = self._timeline_drag_data["last_dx"] / self.scaled_pixels_per_frame if self.scaled_pixels_per_frame else 0
+                effective_ppf = self.scaled_pixels_per_frame * track.track_zoom
+                self.inertia_velocity = self._timeline_drag_data["last_dx"] / effective_ppf if effective_ppf else 0
                 self.is_inertial_scrolling = True
         else:
             if not track.magnet_mode.get():
                 width = track.canvas.winfo_width()
-                pixels_per_frame = self.scaled_pixels_per_frame
-                if pixels_per_frame <= 0:
+                effective_ppf = self.scaled_pixels_per_frame * track.track_zoom
+                if effective_ppf <= 0:
                     return
-                clicked_frame = int(self.timeline_offset + (event.x - width / 2) / pixels_per_frame)
+                clicked_frame = int(self.timeline_offset + (event.x - width / 2) / effective_ppf)
                 node_to_snap = track._find_node_at(clicked_frame, tolerance=config.NODE_CLICK_TOLERANCE)
                 if node_to_snap:
                     logger.info(f"单击吸附到节点: {node_to_snap['name']} ({node_to_snap['frame']})")
