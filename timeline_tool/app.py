@@ -359,6 +359,9 @@ class TimelineApp:
         default_name = f"轨道{len(self.tracks)}"
         track = TimelineTrack(self.tracks_container, self, track_data, default_name=default_name)
         self.tracks.append(track)
+        # 全新轨道默认关闭磁铁，让用户可以自由移动时间轴
+        if track_data is None:
+            track.magnet_mode.set(False)
         self.set_active_track(track)
         self._refresh_track_selector()
         self._adjust_window_height()
@@ -545,13 +548,16 @@ class TimelineApp:
                                     logger.info(f"[{track.name}] 时间流逝中，强制恢复磁铁吸附。")
                                     track.magnet_mode.set(True)
                                 track.magnet_locked = True
+                                track._magnet_unlock_log_done = False
                     elif current_frame == self._last_game_frame:
                         # 时间暂停了（isRunning=True 但帧数没增加）
                         self._is_time_flowing = False
                         for track in self.tracks:
                             if getattr(track, 'magnet_locked', False):
                                 track.magnet_locked = False
-                                logger.info(f"[{track.name}] 时间暂停，解除磁铁吸附锁定。")
+                                if not getattr(track, '_magnet_unlock_log_done', False):
+                                    logger.info(f"[{track.name}] 时间暂停，解除磁铁吸附锁定。")
+                                    track._magnet_unlock_log_done = True
 
                     self._last_game_frame = current_frame
                 else:
@@ -560,6 +566,9 @@ class TimelineApp:
                     for track in self.tracks:
                         if getattr(track, 'magnet_locked', False):
                             track.magnet_locked = False
+                            if not getattr(track, '_magnet_unlock_log_done', False):
+                                logger.info(f"[{track.name}] 时间暂停，解除磁铁吸附锁定。")
+                                track._magnet_unlock_log_done = True
                     self._last_game_frame = -1
 
             if self.is_animating:
@@ -688,7 +697,8 @@ class TimelineApp:
             return
 
         if active.mode.get() == "打轴模式":
-            # 打轴模式不改变吸附状态，保持用户手动设置
+            # 打轴模式自动关闭磁铁，让用户自由移动时间轴
+            active.magnet_mode.set(False)
             self._create_editing_buttons()
         else:
             # 对轴模式强制开启吸附

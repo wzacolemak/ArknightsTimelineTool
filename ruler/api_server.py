@@ -31,11 +31,9 @@ async def broadcast_loop(data_queue: Queue):
             # 使用 get_nowait 避免阻塞事件循环
             data = data_queue.get_nowait()
             message = json.dumps(data)
-            logger.debug(f"从队列获取到数据，准备广播: {message}")
 
             if connected_clients:
                 websockets.broadcast(connected_clients, message)
-                logger.debug(f"已向 {len(connected_clients)} 个客户端广播消息。")
 
         except Empty:
             # 队列为空是正常情况，短暂休眠以让出CPU

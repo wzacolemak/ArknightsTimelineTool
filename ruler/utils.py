@@ -237,7 +237,7 @@ def get_logical_frame_from_calibration(
             logical_frame = pixel_map[str(closest_pixel_value)]
             logger.debug(f"原始宽度 {current_pixel_width} 近似匹配到 {closest_pixel_value} (差异 {min_diff}), 逻辑帧 {logical_frame}")
         else:
-            logger.warning(f"原始宽度 {current_pixel_width} 未能匹配到任何校准值 (最小差异 {min_diff} > {TOLERANCE})")
+            logger.debug(f"原始宽度 {current_pixel_width} 未能匹配到任何校准值 (最小差异 {min_diff} > {TOLERANCE})")
             logical_frame = None
     if dump_prefix:
         info = f"RawWidth: {current_pixel_width}\nLogicalFrame: {logical_frame}"

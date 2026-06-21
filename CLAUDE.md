@@ -344,6 +344,29 @@ timeline_tool/
       - 颜色按默认轮询分配
     - 打包时通过 `build.py:copy_extra_files()` 将 `小工具/` 目录复制到 exe 同级，方便用户直接使用
 
+### 2026-06-16 — 修复进度跳回0 + 减少无效日志
+
+49. **修复创建节点后进度跳回0** — `timeline_tool/app.py`
+    - 根因：`magnet_mode`（磁铁吸附）默认开启，且打轴模式切换/新建轨道时未自动关闭。当磁铁开启时，`get_center_frame()` 返回 `current_game_frame`（尺子帧数，未运行时常为0），导致时间轴显示和节点创建都被锁定在0帧
+    - 修复：
+      1. `add_track()`：全新轨道（`track_data is None`）默认关闭磁铁：`track.magnet_mode.set(False)`
+      2. `_update_ui_for_mode()`：激活轨道切换为**打轴模式**时，自动关闭磁铁：`active.magnet_mode.set(False)`。对轴模式保持现有行为（强制开启）
+
+50. **减少无效日志输出**
+    - `timeline_tool/utils.py`：`setup_logging()` 根 logger 从 DEBUG 提升到 INFO；为 `timeline_tool` 包单独设置 DEBUG；将 `websockets`、`urllib3`、`PIL` 等第三方库设为 WARNING，阻止第三方 DEBUG 日志淹没文件
+    - `ruler/logger_setup.py`：同上，根 logger 提升到 INFO，`ruler` 包保持 DEBUG，第三方库设为 WARNING
+    - `timeline_tool/timeline_track.py`：删除 `update_display()` 中每轮 UI 刷新都输出的冗长 DEBUG 日志；将节点预告 INFO 日志降级为 DEBUG
+    - `timeline_tool/app.py`：`_process_ws_queue()` 中磁铁吸附/解除日志已有状态变化检测（`if not track.magnet_mode.get()` / `if getattr(track, 'magnet_locked', False)`），保持不变
+    - `ruler/api_server.py`：删除广播循环中两条每秒最多输出120次的 DEBUG 日志（打印完整 JSON 和广播客户端数）
+    - `ruler/main.py`：删除外层指令循环每次迭代都输出的 DEBUG 日志（"等待下一条指令..."）；将费用条循环完成 INFO 日志降级为 DEBUG；为"长时间未检测到费用条" WARNING 日志增加10秒节流，避免游戏暂停/切换场景时每秒重复刷屏
+    - `ruler/utils.py`：将图像分析路径上"原始宽度未能匹配到任何校准值"的 WARNING 日志降级为 DEBUG，避免每秒30次输出到控制台
+
+51. **修复磁铁解锁日志刷屏** — `timeline_tool/app.py` + `timeline_track.py`
+    - 根因：`app.py:554` 的 `logger.info("时间暂停，解除磁铁吸附锁定。")` 位于 `_process_ws_queue()` 的 `elif current_frame == _last_game_frame` 分支中。当费用尺 `isRunning` 因截图检测不稳定在 True/False 间反复切换时，`_last_game_frame` 被反复重置为 `-1`，导致 `magnet_locked` 被反复设为 `True` 再解除，同一事件每秒触发多次日志输出
+    - 修复：
+      1. `timeline_track.py`：轨道初始化时新增 `_magnet_unlock_log_done = False` 标志位
+      2. `app.py`：`_process_ws_queue()` 中，每次强制锁定磁铁时重置 `track._magnet_unlock_log_done = False`；解除锁定时先检查该标志，仅当同一周期内未输出过日志时才输出，随后将标志置为 `True`。`is_running=False` 分支同样增加此检测
+
 ### 文件约定
 
 - 代码注释和文档使用中文

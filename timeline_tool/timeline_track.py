@@ -24,6 +24,7 @@ class TimelineTrack:
         self.mode = tk.StringVar(value="打轴模式")
         self.magnet_mode = tk.BooleanVar(value=True)
         self.magnet_locked = False  # 尺子时间流动时锁定吸附，禁止拖拽解除
+        self._magnet_unlock_log_done = False  # 防止解锁日志在同一周期内重复输出
         self.track_zoom = 1.0  # 单轨道缩放比例
         self.sound_alert_enabled = tk.BooleanVar(value=True)
         self.visual_alert_enabled = tk.BooleanVar(value=True)
@@ -221,13 +222,12 @@ class TimelineTrack:
                 next_node = self.current_next_node
                 time_to_next = next_node['frame'] - center_frame if next_node else -1
                 lead = self.alert_lead_frames["visual"]
-                logger.debug(f"[{self.name}] 模式={self.mode.get()}, next_node={next_node}, time_to_next={time_to_next}, lead={lead}")
                 if (self.mode.get() == "对轴模式" and next_node and
                         0 < time_to_next <= lead):
                     self.info_remaining_label.config(
                         text=f"还剩{time_to_next}帧", style="Now.Info.TLabel"
                     )
-                    logger.info(f"[{self.name}] 节点预告: 还剩{time_to_next}帧")
+                    logger.debug(f"[{self.name}] 节点预告: 还剩{time_to_next}帧")
                 elif node_to_display:
                     time_to_next_display = node_to_display['frame'] - center_frame
                     self.info_remaining_label.config(text=f" {time_to_next_display}帧", style="Info.TLabel")

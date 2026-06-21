@@ -78,6 +78,12 @@ def setup_logging(debug_image_mode=False):
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
+    # 调整日志级别：根记录器 INFO，第三方库 WARNING，本项目 DEBUG
+    root_logger.setLevel(logging.INFO)
+    logging.getLogger("timeline_tool").setLevel(logging.DEBUG)
+    for third_party in ("websockets", "urllib3", "PIL"):
+        logging.getLogger(third_party).setLevel(logging.WARNING)
+
     initial_log = logging.getLogger("LoggerSetup")
     initial_log.info("=" * 60)
     initial_log.info("日志系统已初始化。")

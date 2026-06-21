@@ -58,7 +58,9 @@ def analysis_worker(config: dict, ui_queue: queue.Queue, command_queue: queue.Qu
 
     previous_logical_frame = -1
     last_detection_time = time.time()
+    last_reset_warning_time = 0.0
     RESET_TIMEOUT = 1.5
+    RESET_WARNING_INTERVAL = 10.0
 
     try:
         worker_logger.info("正在创建截图控制器...")
@@ -82,7 +84,6 @@ def analysis_worker(config: dict, ui_queue: queue.Queue, command_queue: queue.Qu
             ui_queue.put({"type": "profiles_changed"})
 
         while True:
-            worker_logger.debug("等待下一条指令...")
             command = command_queue.get()
             worker_logger.info(f"收到指令: {command}")
 
@@ -243,7 +244,7 @@ def analysis_worker(config: dict, ui_queue: queue.Queue, command_queue: queue.Qu
                             total_frames_this_cycle = active_profile.get('total_frames', 30)
 
                             if previous_logical_frame > total_frames_this_cycle * 0.75 and logical_frame < total_frames_this_cycle * 0.25:
-                                worker_logger.info(
+                                worker_logger.debug(
                                     f"费用条循环 {cycle_counter} 完成! (周期长度: {total_frames_this_cycle} 帧)")
                                 cycle_base_frames += total_frames_this_cycle
                                 cycle_counter += 1
@@ -255,7 +256,10 @@ def analysis_worker(config: dict, ui_queue: queue.Queue, command_queue: queue.Qu
                             previous_logical_frame = -1
                             if time.time() - last_detection_time > RESET_TIMEOUT:
                                 if cycle_counter or cycle_base_frames or timer_offset_frames:
-                                    worker_logger.warning("长时间未检测到费用条，重置所有计时器。")
+                                    now = time.time()
+                                    if now - last_reset_warning_time > RESET_WARNING_INTERVAL:
+                                        worker_logger.warning("长时间未检测到费用条，重置所有计时器。")
+                                        last_reset_warning_time = now
                                     cycle_counter, cycle_base_frames, timer_offset_frames = 0, 0, 0
                                     last_known_total_frames = 0
                                     lap_timer_active = False
