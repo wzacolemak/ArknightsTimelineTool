@@ -22,6 +22,15 @@ from websocket_client import WebsocketClient
 from timeline_track import TimelineTrack
 from naming_manager import NamingManager
 from naming_dialog import NamingDialog
+from pause_engine import PauseEngine
+from game_window import (
+    BoundWindow,
+    load_bound,
+    save_bound,
+    resolve_game_window,
+    pick_window_under_cursor,
+)
+from hotkey_send import send_pause_key
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +156,11 @@ class TimelineApp:
         # --- WebSocket 时间流逝跟踪（用于磁铁吸附锁定） ---
         self._last_game_frame = -1
         self._is_time_flowing = False
+
+        # --- 自动暂停 ---
+        self.pause_engine = PauseEngine()
+        self._bound_window = load_bound(self._bound_window_path())
+        self._pause_status = "暂停: 就绪"
 
         # --- UI设置与启动 ---
         self._setup_styles()
@@ -333,6 +347,20 @@ class TimelineApp:
         self.track_selector_frame.pack(side=TOP, fill=X, padx=self.scaled_pad_m, pady=self.scaled_pad_m)
         self.bottom_resize_handle.pack(side=BOTTOM, fill=X, padx=self.scaled_pad_m, pady=(0, self.scaled_pad_m))
         content_frame.pack(side=TOP, fill=BOTH, expand=True)
+
+        # 自动暂停：绑定游戏窗 + 状态
+        pause_bar = ttk.Frame(self.ops_frame, style="TFrame")
+        pause_bar.pack(side=BOTTOM, fill=X, pady=self.scaled_pad_s)
+        ttk.Button(
+            pause_bar,
+            text="绑定游戏窗",
+            command=self._bind_game_window_click,
+            style="Tool.TButton",
+        ).pack(side=LEFT, fill=X, expand=True, padx=self.scaled_pad_s)
+        self.pause_status_label = ttk.Label(
+            pause_bar, text=self._pause_status, style="Info.TLabel"
+        )
+        self.pause_status_label.pack(side=LEFT, padx=self.scaled_pad_s)
 
         # 全部打轴/对轴（多轨道时显示，位于模式切换上方）
         # pack(side=BOTTOM) 先 pack 的 widget 在更下方，所以 quit_button 先 pack 会位于底部，
@@ -530,6 +558,9 @@ class TimelineApp:
         try:
             while not self.ws_queue.empty():
                 data = self.ws_queue.get_nowait()
+                # API v2 仍推顶层快照；兼容误包一层 payload 的情况
+                if isinstance(data, dict) and data.get("type") == "snapshot" and "payload" in data:
+                    data = data["payload"]
                 is_running = data.get("isRunning", False)
                 if is_running:
                     self.current_game_frame = data.get("totalElapsedFrames", self.current_game_frame)
@@ -538,6 +569,12 @@ class TimelineApp:
                 if is_running:
                     current_frame = data.get("totalElapsedFrames", self.current_game_frame)
                     self.current_game_frame = current_frame
+
+                    # 自动暂停：帧前进时做边沿检测
+                    try:
+                        self._maybe_auto_pause(current_frame, is_running=True)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("自动暂停处理异常: %s", e)
 
                     if current_frame > self._last_game_frame:
                         # 时间正在流逝：对轴轨道强制吸附并锁定
@@ -590,6 +627,110 @@ class TimelineApp:
             pass
         finally:
             self.root.after(config.QUEUE_POLL_INTERVAL, self._process_ws_queue)
+
+    # ------------------------------------------------------------------
+    # 自动暂停
+    # ------------------------------------------------------------------
+    def _bound_window_path(self) -> str:
+        """绑定窗口缓存路径：开发模式项目根，打包则 exe 同级。"""
+        import sys
+
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            base = (
+                os.path.dirname(script_dir)
+                if os.path.basename(script_dir) == "timeline_tool"
+                else script_dir
+            )
+        return os.path.join(base, config.BOUND_WINDOW_FILE)
+
+    def _set_pause_status(self, text: str) -> None:
+        self._pause_status = text
+        label = getattr(self, "pause_status_label", None)
+        if label is not None:
+            try:
+                label.config(text=text)
+            except TclError:
+                pass
+
+    def _maybe_auto_pause(self, current_frame: int, *, is_running: bool) -> None:
+        events = self.pause_engine.tick(
+            current_frame, self.tracks, is_running=is_running
+        )
+        if not events:
+            return
+        win = resolve_game_window(
+            getattr(config, "GAME_WINDOW_TITLE_KEYWORDS", []),
+            self._bound_window,
+        )
+        hwnd = win["hwnd"] if win else None
+        if not hwnd:
+            self._set_pause_status("暂停: 未找到游戏窗")
+            logger.warning(
+                "触发暂停但未找到游戏窗口（可点「绑定游戏窗」）: %s", events
+            )
+            return
+        hotkey = getattr(config, "PAUSE_HOTKEY", "Space")
+        focus = getattr(config, "FOCUS_GAME_BEFORE_SEND", True)
+        for ev in events:
+            try:
+                send_pause_key(hotkey=hotkey, hwnd=hwnd, focus_before_send=focus)
+                self._set_pause_status(
+                    f"暂停: [{ev['track_name']}] {ev['name']}@{ev['frame']}"
+                )
+                logger.info(
+                    "自动暂停: track=%s frame=%s name=%s",
+                    ev["track_name"],
+                    ev["frame"],
+                    ev["name"],
+                )
+            except Exception as e:  # noqa: BLE001
+                self._set_pause_status(f"暂停失败: {e}")
+                logger.warning("发送暂停键失败: %s", e)
+
+    def _bind_game_window_click(self) -> None:
+        """倒计时后取光标下窗口并保存绑定。"""
+        self._set_pause_status("暂停: 3秒内把鼠标移到游戏窗…")
+        self.root.update_idletasks()
+
+        def _finish() -> None:
+            win = pick_window_under_cursor(timeout_sec=0.05)
+            # 再给一次即时采样（主线程已等 3s）
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                pt = POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                from game_window import window_from_point
+
+                win = window_from_point(pt.x, pt.y) or win
+            except Exception as e:  # noqa: BLE001
+                logger.warning("取光标窗口失败: %s", e)
+            if not win or not win.get("title"):
+                self._set_pause_status("暂停: 绑定失败")
+                return
+            bound = BoundWindow(
+                title=win.get("title", ""),
+                class_name=win.get("class_name", ""),
+                hwnd=int(win.get("hwnd") or 0),
+            )
+            self._bound_window = bound
+            try:
+                save_bound(self._bound_window_path(), bound)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("保存绑定失败: %s", e)
+            short = bound.title[:24] + ("…" if len(bound.title) > 24 else "")
+            self._set_pause_status(f"暂停: 已绑 {short}")
+            logger.info("已绑定游戏窗: %s", bound)
+
+        # 3 秒后采样（期间用户把鼠标移到目标窗）
+        self.root.after(3000, _finish)
 
     def _update_display(self):
         self._distribute_heights()

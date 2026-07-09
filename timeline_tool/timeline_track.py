@@ -28,6 +28,8 @@ class TimelineTrack:
         self.track_zoom = 1.0  # 单轨道缩放比例
         self.sound_alert_enabled = tk.BooleanVar(value=True)
         self.visual_alert_enabled = tk.BooleanVar(value=True)
+        # 总闸：本轨节点是否允许到点自动暂停（默认开）
+        self.pause_enabled = True
         self.alert_lead_frames = {"sound": 60, "visual": 60}
         self.alert_lead_var = tk.StringVar()
         self.alert_lead_var.set(str(self.alert_lead_frames["visual"]))
@@ -119,7 +121,17 @@ class TimelineTrack:
         self.alert_lead_frames["sound"] = data.get("alert_lead_frames", 60)
         self.alert_lead_frames["visual"] = data.get("alert_lead_frames", 60)
         self.alert_lead_var.set(str(self.alert_lead_frames["visual"]))
-        self.timeline_data = data.get("nodes", data.get("timeline_data", []))
+        self.pause_enabled = data.get("pause_enabled", True)
+        raw_nodes = data.get("nodes", data.get("timeline_data", [])) or []
+        # 节点补 pause_on_arrive 默认
+        self.timeline_data = []
+        for n in raw_nodes:
+            if isinstance(n, dict):
+                node = dict(n)
+                node.setdefault("pause_on_arrive", True)
+                self.timeline_data.append(node)
+            else:
+                self.timeline_data.append(n)
 
     def dump_data(self):
         return {
@@ -129,6 +141,7 @@ class TimelineTrack:
             "sound_alert_enabled": self.sound_alert_enabled.get(),
             "visual_alert_enabled": self.visual_alert_enabled.get(),
             "alert_lead_frames": self.alert_lead_frames["visual"],
+            "pause_enabled": bool(self.pause_enabled),
             "nodes": copy.deepcopy(self.timeline_data)
         }
 
@@ -449,7 +462,8 @@ class TimelineTrack:
             new_node = {
                 "frame": current_frame,
                 "name": f"操作@{format_frame_time(current_frame)}",
-                "color": config.NODE_COLORS[0]
+                "color": config.NODE_COLORS[0],
+                "pause_on_arrive": True,
             }
             self.timeline_data.append(new_node)
             logger.info(f"添加了新节点在 {current_frame} 帧")

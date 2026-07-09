@@ -1,5 +1,5 @@
 # --- 项目信息 ---
-VERSION = "TimelineTool_卓越特供版_20260601"
+VERSION = "TimelineTool_独立版_20260710"
 
 # --- 应用设置 ---
 FPS = 30
@@ -73,9 +73,27 @@ COMPACT_LEVEL_3_THRESHOLD = 70   # 减小菱形高度
 COMPACT_DIAMOND_SCALE = 0.5      # 阶段3菱形缩放比例
 
 # --- 网络设置 ---
-WEBSOCKET_URI = "ws://localhost:2606"
+# 最新 Rust 费用尺绑定 127.0.0.1:2606；localhost 亦可。
+WEBSOCKET_URI = "ws://127.0.0.1:2606"
 WEBSOCKET_RECONNECT_DELAY = 5
 QUEUE_POLL_INTERVAL = 16 # ~60 FPS
+
+# --- 自动暂停（到点发键）---
+PAUSE_HOTKEY = "Space"           # 游戏默认暂停键
+FOCUS_GAME_BEFORE_SEND = True    # SendInput 前尝试置前游戏窗
+PAUSE_ENABLED_DEFAULT = True     # 新轨道/节点默认允许暂停
+# 标题关键字（大小写不敏感子串）；点选绑定优先于关键字。
+GAME_WINDOW_TITLE_KEYWORDS = [
+    "明日方舟",
+    "Arknights",
+    "MuMu",
+    "雷电",
+    "LDPlayer",
+    "夜神",
+    "Nox",
+    "BlueStacks",
+]
+BOUND_WINDOW_FILE = "bound_game_window.json"  # 相对项目根 / exe 同级
 
 # --- 日志和资源目录 ---
 LOG_DIR = "logs"

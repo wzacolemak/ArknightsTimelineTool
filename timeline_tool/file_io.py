@@ -5,8 +5,18 @@ from tkinter import filedialog, messagebox
 
 logger = logging.getLogger(__name__)
 
+def _normalize_node(node):
+    """节点默认字段；pause_on_arrive 缺省 True（旧文件兼容）。"""
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    out.setdefault("pause_on_arrive", True)
+    return out
+
+
 def _normalize_track_data(track):
     """确保轨道数据包含所有必要字段，填充默认值。"""
+    raw_nodes = track.get("nodes", track.get("timeline_data", [])) or []
     return {
         "name": track.get("name", "默认轨道"),
         "mode": track.get("mode", "打轴模式"),
@@ -14,7 +24,8 @@ def _normalize_track_data(track):
         "sound_alert_enabled": track.get("sound_alert_enabled", True),
         "visual_alert_enabled": track.get("visual_alert_enabled", True),
         "alert_lead_frames": track.get("alert_lead_frames", 60),
-        "nodes": track.get("nodes", track.get("timeline_data", []))
+        "pause_enabled": track.get("pause_enabled", True),
+        "nodes": [_normalize_node(n) for n in raw_nodes],
     }
 
 def _load_from_path(filepath):
