@@ -11,3 +11,5 @@ bound_game_window.json
 dist/
 build/
 *.spec
+TimelineTool.exe
+TimelineTool_*.exe
