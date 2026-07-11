@@ -46,7 +46,7 @@
 
 同一帧的多个节点只暂停一次；不同帧的节点会在每次恢复游戏后依次暂停。
 
-PC 客户端建议以管理员身份运行 TimelineTool，否则系统可能拦截自动暂停。模拟器会优先使用 ADB 输入；多开模拟器时，请在 `timeline_tool/config.py` 中填写正确的 `ADB_SERIAL`。
+使用 PC 客户端自动暂停时，必须右键 `TimelineTool_YYYYMMDD.exe`，选择「以管理员身份运行」。否则系统可能拦截暂停输入。模拟器自动暂停通常不需要管理员权限；多开模拟器时，请在 `timeline_tool/config.py` 中填写正确的 `ADB_SERIAL`。
 
 ## 保存与导入
 
