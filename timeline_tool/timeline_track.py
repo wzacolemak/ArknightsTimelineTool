@@ -2,12 +2,53 @@ import copy
 import tkinter as tk
 from tkinter import ttk, simpledialog, font
 import logging
+import math
+
+from PIL import Image, ImageDraw, ImageTk
 
 import config
 from utils import format_frame_time
 from operator_portrait_manager import OperatorPortraitManager
 
 logger = logging.getLogger(__name__)
+
+
+def render_antialiased_diamond(
+    *,
+    fill: str,
+    outline: str,
+    outline_width: int,
+    half_width: float,
+    half_height: float,
+    oversample: int = 4,
+) -> Image.Image:
+    """用高分辨率绘制后缩小，得到带半透明斜边的抗锯齿菱形。"""
+    scale = max(2, int(oversample))
+    border = max(1, int(outline_width))
+    pad = border + 2
+    width = max(3, int(math.ceil(half_width * 2 + pad * 2)))
+    height = max(3, int(math.ceil(half_height * 2 + pad * 2)))
+    hi_width = width * scale
+    hi_height = height * scale
+    center_x = hi_width / 2
+    center_y = hi_height / 2
+    hw = max(1.0, float(half_width)) * scale
+    hh = max(1.0, float(half_height)) * scale
+    points = [
+        (center_x, center_y - hh),
+        (center_x + hw, center_y),
+        (center_x, center_y + hh),
+        (center_x - hw, center_y),
+    ]
+    image = Image.new("RGBA", (hi_width, hi_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.polygon(
+        points,
+        fill=fill,
+        outline=outline,
+        width=max(1, border * scale),
+    )
+    return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
 class TimelineTrack:
@@ -20,6 +61,7 @@ class TimelineTrack:
         self.is_flashing = False
         self._flash_after_id = None
         self._portrait_images = []  # 防止 PhotoImage 被垃圾回收
+        self._node_image_cache = {}  # 抗锯齿菱形缓存，避免每帧重复生成
 
         self.mode = tk.StringVar(value="打轴模式")
         self.magnet_mode = tk.BooleanVar(value=True)
@@ -29,7 +71,9 @@ class TimelineTrack:
         self.sound_alert_enabled = tk.BooleanVar(value=True)
         self.visual_alert_enabled = tk.BooleanVar(value=True)
         # 总闸：本轨节点是否允许到点自动暂停（默认开）
-        self.pause_enabled = True
+        self.pause_enabled = tk.BooleanVar(
+            value=bool(getattr(config, "PAUSE_ENABLED_DEFAULT", True))
+        )
         self.alert_lead_frames = {"sound": 60, "visual": 60}
         self.alert_lead_var = tk.StringVar()
         self.alert_lead_var.set(str(self.alert_lead_frames["visual"]))
@@ -108,6 +152,26 @@ class TimelineTrack:
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_drag_release)
+        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-4>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-5>", self._on_mouse_wheel)
+
+    def _on_mouse_wheel(self, event):
+        """光标位于轨道时，滚轮每格前后移动一个逻辑帧。"""
+        delta = int(getattr(event, "delta", 0) or 0)
+        button = getattr(event, "num", None)
+        if delta > 0 or button == 4:
+            direction = -1
+        elif delta < 0 or button == 5:
+            direction = 1
+        else:
+            return "break"
+        self.app._move_timeline_by_frames(
+            direction * config.MOUSE_WHEEL_SCROLL_STEP,
+            track=self,
+        )
+        return "break"
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
@@ -121,7 +185,7 @@ class TimelineTrack:
         self.alert_lead_frames["sound"] = data.get("alert_lead_frames", 60)
         self.alert_lead_frames["visual"] = data.get("alert_lead_frames", 60)
         self.alert_lead_var.set(str(self.alert_lead_frames["visual"]))
-        self.pause_enabled = data.get("pause_enabled", True)
+        self.pause_enabled.set(bool(data.get("pause_enabled", True)))
         raw_nodes = data.get("nodes", data.get("timeline_data", [])) or []
         # 节点补 pause_on_arrive 默认
         self.timeline_data = []
@@ -136,14 +200,128 @@ class TimelineTrack:
     def dump_data(self):
         return {
             "name": self.name,
-            "mode": "对轴模式",
+            "mode": self.mode.get(),
             "magnet_mode": self.magnet_mode.get(),
             "sound_alert_enabled": self.sound_alert_enabled.get(),
             "visual_alert_enabled": self.visual_alert_enabled.get(),
             "alert_lead_frames": self.alert_lead_frames["visual"],
-            "pause_enabled": bool(self.pause_enabled),
+            "pause_enabled": bool(self.pause_enabled.get()),
             "nodes": copy.deepcopy(self.timeline_data)
         }
+
+    def toggle_node_pause_at_cursor(self):
+        """切换中心节点的 pause_on_arrive。"""
+        node = self._find_node_at(self.get_center_frame(), tolerance=config.NODE_FIND_TOLERANCE)
+        if not node:
+            logger.info("切换节点暂停：中心处无节点")
+            return
+        cur = bool(node.get("pause_on_arrive", True))
+        node["pause_on_arrive"] = not cur
+        logger.info(
+            "节点 '%s' 到点暂停 → %s",
+            node.get("name"),
+            "开" if node["pause_on_arrive"] else "关",
+        )
+        self.app._mark_dirty()
+        try:
+            self.update_display()
+        except Exception:  # noqa: BLE001
+            self.app._update_display()
+
+    def rename_track_prompt(self, event=None):
+        """按钮/菜单调用的轨道重命名。"""
+        self._rename_track(event)
+
+    def configure_node_at_cursor(self):
+        """节点配置：名称 + 到点自动暂停。"""
+        node = self._find_node_at(self.get_center_frame(), tolerance=config.NODE_FIND_TOLERANCE)
+        if not node:
+            # 打轴时若中心无节点，回退到「下一节点」便于对轴配置
+            node = self.current_next_node
+        if not node:
+            logger.info("节点配置：附近无节点")
+            try:
+                from tkinter import messagebox
+                messagebox.showinfo("节点配置", "请把中心线对准节点后再试。", parent=self.app.root)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        dlg = tk.Toplevel(self.app.root)
+        dlg.title("节点配置")
+        dlg.transient(self.app.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        try:
+            dlg.configure(bg="#282c34")
+        except tk.TclError:
+            pass
+
+        pad = max(6, int(self.app.scaled_pad_m * 2))
+        frm = ttk.Frame(dlg, style="TFrame", padding=pad)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="名称:", style="Info.TLabel").grid(row=0, column=0, sticky="w", pady=pad)
+        name_var = tk.StringVar(value=str(node.get("name", "")))
+        name_entry = ttk.Entry(frm, textvariable=name_var, width=28)
+        name_entry.grid(row=0, column=1, sticky="ew", pady=pad, padx=(pad, 0))
+        name_entry.focus_set()
+        name_entry.selection_range(0, tk.END)
+
+        pause_var = tk.BooleanVar(value=bool(node.get("pause_on_arrive", True)))
+        pause_chk = ttk.Checkbutton(
+            frm,
+            text="到点自动暂停（对轴模式）",
+            variable=pause_var,
+        )
+        pause_chk.grid(row=1, column=0, columnspan=2, sticky="w", pady=pad)
+
+        ttk.Label(
+            frm,
+            text=f"帧: {node.get('frame', '?')}",
+            style="Info.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        btn_row = ttk.Frame(frm, style="TFrame")
+        btn_row.grid(row=3, column=0, columnspan=2, sticky="e", pady=(pad, 0))
+
+        def on_ok():
+            new_name = name_var.get().strip()
+            if new_name:
+                old = node.get("name")
+                node["name"] = new_name
+                if old != new_name:
+                    logger.info("节点 '%s' 重命名为 '%s'", old, new_name)
+            node["pause_on_arrive"] = bool(pause_var.get())
+            logger.info(
+                "节点 '%s' 到点暂停=%s",
+                node.get("name"),
+                node["pause_on_arrive"],
+            )
+            self.app._mark_dirty()
+            try:
+                self.update_display()
+            except Exception:  # noqa: BLE001
+                self.app._update_display()
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="取消", command=on_cancel, style="Tool.TButton").pack(
+            side=tk.RIGHT, padx=(pad, 0)
+        )
+        ttk.Button(btn_row, text="确定", command=on_ok, style="Tool.TButton").pack(side=tk.RIGHT)
+        dlg.bind("<Return>", lambda e: on_ok())
+        dlg.bind("<Escape>", lambda e: on_cancel())
+
+        dlg.update_idletasks()
+        try:
+            x = self.app.root.winfo_rootx() + 40
+            y = self.app.root.winfo_rooty() + 40
+            dlg.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------
     # Geometry helpers
@@ -256,6 +434,12 @@ class TimelineTrack:
         self.magnet_indicator.config(text="磁铁" if self.magnet_mode.get() else "")
         self.sound_indicator.config(text="🔊" if self.sound_alert_enabled.get() else "")
         self.visual_indicator.config(text="👁" if self.visual_alert_enabled.get() else "")
+        # 轨道暂停总闸（对轴时有意义）
+        pause_on = bool(self.pause_enabled.get()) if hasattr(self.pause_enabled, "get") else bool(self.pause_enabled)
+        if not hasattr(self, "pause_indicator"):
+            self.pause_indicator = ttk.Label(self.title_bar, text="", style="Info.TLabel")
+            self.pause_indicator.pack(side=tk.LEFT, padx=self.app.scaled_pad_m)
+        self.pause_indicator.config(text="⏸" if pause_on else "⏸×")
 
         # Alerts (only in 对轴模式)
         if self.mode.get() == "对轴模式" and self.current_next_node:
@@ -312,6 +496,35 @@ class TimelineTrack:
                 y1 = height / 2 + self.app.scaled_minor_tick_h
                 canvas.create_line(x_pos, y0, x_pos, y1, fill=config.TIMELINE_SUBTICK_COLOR, width=1)
 
+    def _get_node_diamond_photo(
+        self,
+        *,
+        fill,
+        outline,
+        outline_width,
+        half_width,
+        half_height,
+    ):
+        key = (
+            fill,
+            outline,
+            int(outline_width),
+            round(float(half_width), 2),
+            round(float(half_height), 2),
+        )
+        photo = self._node_image_cache.get(key)
+        if photo is None:
+            image = render_antialiased_diamond(
+                fill=fill,
+                outline=outline,
+                outline_width=outline_width,
+                half_width=half_width,
+                half_height=half_height,
+            )
+            photo = ImageTk.PhotoImage(image)
+            self._node_image_cache[key] = photo
+        return photo
+
     def _draw_nodes(self, canvas, center_frame, width, height, pixels_per_frame, node_on_cursor, compact_level=0):
         # 1) 绘制所有菱形
         visible_nodes = []
@@ -329,13 +542,34 @@ class TimelineTrack:
             scale = config.NODE_SELECTED_SCALE if node == node_on_cursor else 1.0
             outline_color = config.NODE_SELECTED_OUTLINE_COLOR if node == node_on_cursor else config.NODE_OUTLINE_COLOR
             outline_width = 2 if node == node_on_cursor else 1
+            # 关闭「到点暂停」的节点用灰色轮廓区分
+            if not bool(node.get("pause_on_arrive", True)):
+                outline_color = "#888888"
+                outline_width = max(outline_width, 2)
 
             h = self.app.scaled_node_diamond_h * scale * diamond_scale
             w = self.app.scaled_node_diamond_w * scale * diamond_scale
-            points = [x_pos, height / 2 - h, x_pos + w, height / 2,
-                      x_pos, height / 2 + h, x_pos - w, height / 2]
-            canvas.create_polygon(points, fill=node["color"], outline=outline_color,
-                                  width=outline_width, tags=f"node_{node['frame']}")
+            photo = self._get_node_diamond_photo(
+                fill=node["color"],
+                outline=outline_color,
+                outline_width=outline_width,
+                half_width=w,
+                half_height=h,
+            )
+            canvas.create_image(
+                x_pos,
+                height / 2,
+                image=photo,
+                tags=f"node_{node['frame']}",
+            )
+            if not bool(node.get("pause_on_arrive", True)):
+                # 小标记：无暂停
+                canvas.create_text(
+                    x_pos, height / 2 - h - 2,
+                    text="×", fill="#aaaaaa",
+                    font=(config.FONT_FAMILY, max(7, self.app.scaled_font_normal)),
+                    anchor="s",
+                )
 
         # 2) 文字避让绘制
         # 紧凑级别 >= 2 时隐藏时间轴下方的节点名称
@@ -488,15 +722,23 @@ class TimelineTrack:
 
     def change_node_color_at_cursor(self):
         node = self._find_node_at(self.get_center_frame(), tolerance=config.NODE_FIND_TOLERANCE)
-        if node:
-            try:
-                current_color_index = config.NODE_COLORS.index(node['color'])
-                next_color_index = (current_color_index + 1) % len(config.NODE_COLORS)
-                node['color'] = config.NODE_COLORS[next_color_index]
-            except ValueError:
-                node['color'] = config.NODE_COLORS[0]
-            logger.debug(f"节点 '{node['name']}' 颜色已更改为 {node['color']}")
-            self.app._mark_dirty()
+        if not node:
+            logger.info("切换颜色：中心处无节点（请把蓝线对准节点菱形）")
+            return
+        try:
+            current_color_index = config.NODE_COLORS.index(node['color'])
+            next_color_index = (current_color_index + 1) % len(config.NODE_COLORS)
+            node['color'] = config.NODE_COLORS[next_color_index]
+        except ValueError:
+            node['color'] = config.NODE_COLORS[0]
+        logger.info(f"节点 '{node['name']}' 颜色已更改为 {node['color']}")
+        self.app._mark_dirty()
+        # 立即重绘（否则要等下一帧 WS 推送才看得见）
+        try:
+            self.update_display()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("颜色切换后重绘失败: %s", e)
+            self.app._update_display()
 
     def _on_node_name_click(self, event):
         if self.mode.get() == "打轴模式":

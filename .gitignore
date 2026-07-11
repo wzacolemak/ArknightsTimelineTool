@@ -13,3 +13,6 @@ build/
 *.spec
 TimelineTool.exe
 TimelineTool_*.exe
+.claude/
+.superpowers/
+docs/superpowers/

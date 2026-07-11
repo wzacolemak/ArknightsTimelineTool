@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, simpledialog, TclError
+from tkinter import ttk, simpledialog, TclError, messagebox
 import ttkbootstrap as ttkb
 from ttkbootstrap.constants import *
 import queue
@@ -22,15 +22,21 @@ from websocket_client import WebsocketClient
 from timeline_track import TimelineTrack
 from naming_manager import NamingManager
 from naming_dialog import NamingDialog
-from pause_engine import PauseEngine
+from pause_engine import PauseEngine, resolve_lead_frames
+from pause_queue import PauseGroup, PendingPauseQueue
+from ruler_process import find_ruler_process_ids
 from game_window import (
     BoundWindow,
     load_bound,
     save_bound,
     resolve_game_window,
     pick_window_under_cursor,
+    refresh_bound_hwnd,
+    find_maa_pc_client,
+    describe_hwnd,
 )
-from hotkey_send import send_pause_key
+from hotkey_send import is_elevated, send_adb_pause_key, send_pc_pause_key
+from adb_input import looks_like_emulator_window
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +167,47 @@ class TimelineApp:
         self.pause_engine = PauseEngine()
         self._bound_window = load_bound(self._bound_window_path())
         self._pause_status = "暂停: 就绪"
+        # None | "verifying" | "frozen"
+        # verifying: 刚发键，按费用尺帧确认是否真停
+        # frozen: 已确认停表，等用户恢复后再允许下一次
+        self._pause_gate = None
+        self._pause_gate_frame = -1
+        self._pause_verify = None  # dict: method_used/start_frame/stall_*/...
+        self._pending_pause_groups = PendingPauseQueue()
+        self._active_pause_group = None
+        self._admin_warned = False
+        self._duplicate_ruler_warned = False
+        self._is_admin = is_elevated()
+        # 暂停提前帧（全局，操作面板 Spinbox；持久化 pause_settings.json）
+        self.pause_lead_var = tk.StringVar()
+        self._load_pause_settings()
+        if not self._is_admin:
+            logger.warning(
+                "当前未以管理员运行：绑定 PC 客户端时自动暂停可能无效，"
+                "请右键 TimelineTool.exe → 以管理员身份运行"
+            )
+        if self._bound_window:
+            logger.info(
+                "已加载绑定窗: title=%r class=%r hwnd=%s",
+                self._bound_window.title,
+                self._bound_window.class_name,
+                self._bound_window.hwnd,
+            )
+
+        # --- 窗口最小化（无边框 HUD） ---
+        self._minimized = False
+        self._restore_geometry = None
+        self._normal_alpha = config.DEFAULT_ALPHA
 
         # --- UI设置与启动 ---
         self._setup_styles()
         self._setup_ui()
         self._setup_keybindings()
+        # 空白区域拖窗：bind_all + 命中过滤（ttk 空白区往往收不到自身绑定）
+        self._window_dragging = False
+        self.root.bind_all("<ButtonPress-1>", self._on_global_window_press, add="+")
+        self.root.bind_all("<B1-Motion>", self._on_global_window_motion, add="+")
+        self.root.bind_all("<ButtonRelease-1>", self._on_global_window_release, add="+")
 
         if open_file and os.path.exists(open_file):
             # 重启后重新打开原文件
@@ -181,6 +223,7 @@ class TimelineApp:
         self.ws_client = WebsocketClient(config.WEBSOCKET_URI)
         self.ws_client.start(self.ws_queue)
         self.root.after(config.QUEUE_POLL_INTERVAL, self._process_ws_queue)
+        self.root.after(800, self._check_duplicate_rulers)
         logger.info(f"TimelineApp {config.VERSION} 初始化完成。")
 
     def _calculate_scaled_dimensions(self):
@@ -230,10 +273,23 @@ class TimelineApp:
 
     def _load_icons(self):
         """加载所有需要的图标文件。"""
-        icon_files = {"open": "open.png", "save": "save.png", "magnet_on": "magnet_on.png",
-                      "magnet_off": "magnet_off.png", "add": "add.png", "remove": "remove.png", "color": "color.png",
-                      "sound_on": "sound_on.png", "sound_off": "sound_off.png", "visual_on": "visual_on.png",
-                      "visual_off": "visual_off.png", "rename": "rename.png", "restart": "start.png"}
+        icon_files = {
+            "open": "open.png",
+            "save": "save.png",
+            "magnet_on": "magnet_on.png",
+            "magnet_off": "magnet_off.png",
+            "add": "add.png",
+            "remove": "remove.png",
+            "color": "color.png",
+            "sound_on": "sound_on.png",
+            "sound_off": "sound_off.png",
+            "visual_on": "visual_on.png",
+            "visual_off": "visual_off.png",
+            "rename": "rename.png",
+            "restart": "start.png",
+            "pause_on": "pause_on.png",
+            "pause_off": "pause_off.png",
+        }
         for name, filename in icon_files.items():
             path = resource_path(os.path.join(config.ICON_DIR, filename))
             try:
@@ -261,13 +317,8 @@ class TimelineApp:
 
         # --- 顶部轨道选择栏 ---
         self.track_selector_frame = ttk.Frame(main_frame, style="TFrame")
-
-        # 拖动窗体的专用手柄按钮
-        drag_handle = ttk.Button(self.track_selector_frame, text="⋮⋮", cursor="fleur",
-                                 style="Tool.TButton", width=2)
-        drag_handle.pack(side=LEFT, padx=(0, self.scaled_pad_s))
-        drag_handle.bind("<ButtonPress-1>", self._on_window_drag_start)
-        drag_handle.bind("<B1-Motion>", self._on_window_drag_motion)
+        # 顶栏整体标记为可拖区域（子按钮仍通过 class 拦截）
+        self.track_selector_frame._hud_drag_zone = True
 
         self.add_track_btn = ttk.Button(self.track_selector_frame, text="新建轨道", command=self._add_new_track,
                                         style="Tool.TButton")
@@ -276,13 +327,37 @@ class TimelineApp:
                                            command=self._remove_active_track, style="Tool.TButton")
         self.remove_track_btn.pack(side=LEFT, padx=self.scaled_pad_s)
 
+        # 中间可扩展区：轨道页签 + 右侧空白拖条（ttk 空白常点不到，用 tk.Frame）
         self.track_buttons_frame = ttk.Frame(self.track_selector_frame, style="TFrame")
         self.track_buttons_frame.pack(side=LEFT, fill=X, expand=True, padx=self.scaled_pad_m)
+        self.track_buttons_frame._hud_drag_zone = True
+        self._top_drag_filler = tk.Frame(
+            self.track_buttons_frame, bg="#282c34", cursor="fleur", height=1
+        )
+        self._top_drag_filler._hud_drag_zone = True
+        self._top_drag_filler.pack(side=RIGHT, fill=BOTH, expand=True)
 
-        # 红色叉号关闭按钮（最右侧，先 pack 保证在最右边）
-        close_btn = ttk.Button(self.track_selector_frame, text="✕", command=self._on_close_request,
-                               style="Danger.TButton", width=2)
+        # 关闭按钮：与工具栏同色，仅悬停略亮（避免 Danger 常亮红）
+        close_btn = ttk.Button(
+            self.track_selector_frame,
+            text="✕",
+            command=self._on_close_request,
+            style="Tool.TButton",
+            width=2,
+        )
         close_btn.pack(side=RIGHT, padx=(self.scaled_pad_s, 0))
+        SimpleTooltip(close_btn, text="关闭")
+
+        # 最小化：收成细条，只留恢复/关闭
+        min_btn = ttk.Button(
+            self.track_selector_frame,
+            text="—",
+            command=self._minimize_window,
+            style="Tool.TButton",
+            width=2,
+        )
+        min_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
+        SimpleTooltip(min_btn, text="最小化")
 
         # 重启按钮
         restart_icon = self.icons.get("restart")
@@ -295,24 +370,50 @@ class TimelineApp:
             SimpleTooltip(restart_btn, text="重启")
         restart_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
 
-        # 折叠/展开左侧操作面板按钮（pack 在 restart 之后，确保显示在 restart 左侧）
+        # 折叠/展开左侧操作面板
         self.collapse_btn = ttk.Button(self.track_selector_frame, text="◀", command=self._toggle_ops_panel,
                                        style="Tool.TButton", width=2)
         self.collapse_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
         self.collapse_btn._tooltip = SimpleTooltip(self.collapse_btn, text="隐藏操作面板")
 
-        # --- 底部 resize handle（双横线，调高度） ---
+        # 打开/保存：针对整份轴文件，放顶栏右侧（折叠按钮左侧）
+        open_icon = self.icons.get("open")
+        save_icon = self.icons.get("save")
+        self.top_open_btn = ttk.Button(
+            self.track_selector_frame, command=self._load_timeline, style="Tool.TButton"
+        )
+        if open_icon:
+            self.top_open_btn.config(image=open_icon)
+        else:
+            self.top_open_btn.config(text="打开")
+        SimpleTooltip(self.top_open_btn, text="打开时间轴文件")
+        self.top_open_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
+
+        self.top_save_btn = ttk.Button(
+            self.track_selector_frame, command=self._save_timeline, style="Tool.TButton"
+        )
+        if save_icon:
+            self.top_save_btn.config(image=save_icon)
+        else:
+            self.top_save_btn.config(text="保存")
+        SimpleTooltip(self.top_save_btn, text="保存时间轴文件")
+        self.top_save_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
+
+        # --- 底部 resize handle（双横线，只调高度，禁止拖窗） ---
         # 注意：必须在 content_frame 之前 pack，否则 expand=True 的 content_frame
         # 会抢占全部剩余空间，导致 bottom_resize_handle 被挤出可视区域。
         self.bottom_resize_handle = tk.Frame(main_frame, bg="#3e4451", cursor="sb_v_double_arrow",
                                              height=self.scaled_bottom_handle_height)
         self.bottom_resize_handle.pack_propagate(False)
+        self.bottom_resize_handle._no_hud_drag = True
         bottom_label = tk.Label(self.bottom_resize_handle, text="━━", bg="#3e4451", fg="#5c6370",
                                 font=(config.FONT_FAMILY, self.scaled_font_normal))
+        bottom_label._no_hud_drag = True
         bottom_label.pack(expand=True)
         for w in (self.bottom_resize_handle, bottom_label):
             w.bind("<ButtonPress-1>", self._on_resize_height_start)
             w.bind("<B1-Motion>", self._on_resize_height_motion)
+            w.bind("<ButtonRelease-1>", lambda e: setattr(self, "_window_dragging", False))
 
         # --- 内容区域（左 ops + 右 tracks） ---
         content_frame = ttk.Frame(main_frame, style="TFrame")
@@ -335,13 +436,48 @@ class TimelineApp:
         self.right_resize_handle = tk.Frame(content_frame, bg="#3e4451", cursor="sb_h_double_arrow",
                                             width=self.scaled_right_handle_width)
         self.right_resize_handle.pack_propagate(False)
+        self.right_resize_handle._no_hud_drag = True
         right_label = tk.Label(self.right_resize_handle, text="┃┃", bg="#3e4451", fg="#5c6370",
                                font=(config.FONT_FAMILY, self.scaled_font_normal))
+        right_label._no_hud_drag = True
         right_label.pack(expand=True)
         self.right_resize_handle.pack(side=RIGHT, fill=Y, padx=(0, self.scaled_pad_m), pady=self.scaled_pad_m)
         for w in (self.right_resize_handle, right_label):
             w.bind("<ButtonPress-1>", self._on_resize_width_start)
             w.bind("<B1-Motion>", self._on_resize_width_motion)
+            w.bind("<ButtonRelease-1>", lambda e: setattr(self, "_window_dragging", False))
+
+        # 主内容容器（最小化时整块隐藏）
+        self._main_frame = main_frame
+        self._content_frame = content_frame
+
+        # 最小化细条（默认不显示）
+        self._mini_bar = ttk.Frame(self.root, style="TFrame")
+        self._mini_bar._hud_drag_zone = True
+        mini_label = ttk.Label(
+            self._mini_bar,
+            text="打轴器",
+            style="Info.TLabel",
+            cursor="fleur",
+        )
+        mini_label.pack(side=LEFT, padx=self.scaled_pad_m)
+        mini_label._hud_drag_zone = True
+        for w in (self._mini_bar, mini_label):
+            w.bind("<Double-Button-1>", lambda e: self._restore_window())
+        ttk.Button(
+            self._mini_bar,
+            text="▢",
+            command=self._restore_window,
+            style="Tool.TButton",
+            width=2,
+        ).pack(side=RIGHT, padx=self.scaled_pad_s)
+        ttk.Button(
+            self._mini_bar,
+            text="✕",
+            command=self._on_close_request,
+            style="Tool.TButton",
+            width=2,
+        ).pack(side=RIGHT, padx=self.scaled_pad_s)
 
         # pack 顺序：先顶部栏 → 再底部把手 → 最后内容区（expand 填满中间剩余空间）
         self.track_selector_frame.pack(side=TOP, fill=X, padx=self.scaled_pad_m, pady=self.scaled_pad_m)
@@ -387,9 +523,9 @@ class TimelineApp:
         default_name = f"轨道{len(self.tracks)}"
         track = TimelineTrack(self.tracks_container, self, track_data, default_name=default_name)
         self.tracks.append(track)
-        # 全新轨道默认关闭磁铁，让用户可以自由移动时间轴
+        # 新轨道默认开磁铁：蓝线跟着费用尺；可关磁铁后拖动，点「回正」再跟上
         if track_data is None:
-            track.magnet_mode.set(False)
+            track.magnet_mode.set(True)
         self.set_active_track(track)
         self._refresh_track_selector()
         self._adjust_window_height()
@@ -458,13 +594,26 @@ class TimelineApp:
 
     def _refresh_track_selector(self):
         for widget in self.track_buttons_frame.winfo_children():
+            # 保留右侧空白拖条
+            if widget is getattr(self, "_top_drag_filler", None):
+                continue
             widget.destroy()
         self.track_buttons = []
         for idx, track in enumerate(self.tracks):
             btn = ttk.Button(self.track_buttons_frame, text=track.name,
                              command=lambda t=track: self.set_active_track(t),
                              style="Tool.TButton")
-            btn.pack(side=LEFT, padx=self.scaled_pad_s)
+            # 双击顶栏轨道页签重命名
+            btn.bind(
+                "<Double-Button-1>",
+                lambda e, t=track: t.rename_track_prompt(),
+            )
+            SimpleTooltip(btn, text="单击切换 · 双击重命名")
+            # 页签在拖条左侧
+            if getattr(self, "_top_drag_filler", None):
+                btn.pack(side=LEFT, padx=self.scaled_pad_s, before=self._top_drag_filler)
+            else:
+                btn.pack(side=LEFT, padx=self.scaled_pad_s)
             self.track_buttons.append(btn)
         # 重新应用高亮
         if self.tracks and 0 <= self.active_track_index < len(self.tracks):
@@ -553,6 +702,40 @@ class TimelineApp:
     # ------------------------------------------------------------------
     # Display
     # ------------------------------------------------------------------
+    def _check_duplicate_rulers(self) -> None:
+        """周期检测费用尺多开，避免旧实例独占 2606 导致时间轴不跟随。"""
+        try:
+            pids = find_ruler_process_ids()
+            if len(pids) > 1:
+                self._set_pause_status(f"费用尺多开: {len(pids)} 个进程")
+                if not self._duplicate_ruler_warned:
+                    self._duplicate_ruler_warned = True
+                    logger.warning(
+                        "检测到费用尺多开 pids=%s；旧实例可能独占 127.0.0.1:2606，"
+                        "导致打轴器连接错误且时间轴不跟随",
+                        pids,
+                    )
+                    messagebox.showwarning(
+                        "检测到费用尺多开",
+                        "检测到多个 ruler-app.exe 进程：\n\n"
+                        f"PID: {', '.join(str(pid) for pid in pids)}\n\n"
+                        "旧的或无响应的费用尺可能占用 127.0.0.1:2606，\n"
+                        "导致打轴器连接到错误实例、时间轴不跟随。\n\n"
+                        "请关闭所有费用尺，再只启动一个费用尺。",
+                    )
+            else:
+                self._duplicate_ruler_warned = False
+        except Exception as e:  # noqa: BLE001
+            logger.debug("检测费用尺多开失败: %s", e)
+        finally:
+            try:
+                interval = int(
+                    getattr(config, "RULER_PROCESS_CHECK_INTERVAL_MS", 5000)
+                )
+                self.root.after(max(1000, interval), self._check_duplicate_rulers)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _process_ws_queue(self):
         """处理来自WebSocket的消息队列并更新UI。"""
         try:
@@ -570,7 +753,7 @@ class TimelineApp:
                     current_frame = data.get("totalElapsedFrames", self.current_game_frame)
                     self.current_game_frame = current_frame
 
-                    # 自动暂停：帧前进时做边沿检测
+                    # 自动暂停：帧前进时做边沿检测（内部会更新暂停门闩）
                     try:
                         self._maybe_auto_pause(current_frame, is_running=True)
                     except Exception as e:  # noqa: BLE001
@@ -589,6 +772,10 @@ class TimelineApp:
                     elif current_frame == self._last_game_frame:
                         # 时间暂停了（isRunning=True 但帧数没增加）
                         self._is_time_flowing = False
+                        # 门闩推进的单一入口是 _maybe_auto_pause（上面已在本轮调过
+                        # _update_pause_gate(current_frame)）。此处不再二次调用，
+                        # 否则同一份停帧快照会把 verifying 的 stall_count 双计，
+                        # 把单帧抖动误判为已稳定停表（final-review I1）。
                         for track in self.tracks:
                             if getattr(track, 'magnet_locked', False):
                                 track.magnet_locked = False
@@ -598,8 +785,13 @@ class TimelineApp:
 
                     self._last_game_frame = current_frame
                 else:
-                    # 尺子未运行：解除锁定并重置帧数跟踪
+                    # 尺子未运行：解除锁定；若在校验，视为已停表
                     self._is_time_flowing = False
+                    if self._pause_gate == "verifying":
+                        self._mark_pause_verified(self.current_game_frame, "isRunning=false")
+                    elif self._pause_gate == "frozen":
+                        # 保持 frozen，等 isRunning 再 True 且帧前进后解锁
+                        pass
                     for track in self.tracks:
                         if getattr(track, 'magnet_locked', False):
                             track.magnet_locked = False
@@ -631,20 +823,85 @@ class TimelineApp:
     # ------------------------------------------------------------------
     # 自动暂停
     # ------------------------------------------------------------------
-    def _bound_window_path(self) -> str:
-        """绑定窗口缓存路径：开发模式项目根，打包则 exe 同级。"""
+    def _app_data_dir(self) -> str:
+        """配置/绑定文件目录：开发模式项目根，打包则 exe 同级。"""
         import sys
 
         if getattr(sys, "frozen", False):
-            base = os.path.dirname(sys.executable)
-        else:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            base = (
-                os.path.dirname(script_dir)
-                if os.path.basename(script_dir) == "timeline_tool"
-                else script_dir
+            return os.path.dirname(sys.executable)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return (
+            os.path.dirname(script_dir)
+            if os.path.basename(script_dir) == "timeline_tool"
+            else script_dir
+        )
+
+    def _bound_window_path(self) -> str:
+        return os.path.join(self._app_data_dir(), config.BOUND_WINDOW_FILE)
+
+    def _pause_settings_path(self) -> str:
+        name = getattr(config, "PAUSE_SETTINGS_FILE", "pause_settings.json")
+        return os.path.join(self._app_data_dir(), name)
+
+    def _load_pause_settings(self) -> None:
+        """加载 pause_settings.json；缺省用 config.PAUSE_LEAD_FRAMES。"""
+        import json
+
+        default_lead = getattr(config, "PAUSE_LEAD_FRAMES", 1)
+        if default_lead is None:
+            default_lead = resolve_lead_frames(
+                lead_frames=None,
+                lead_ms=getattr(config, "PAUSE_LEAD_MS", 0),
+                logic_fps=getattr(config, "LOGIC_FPS", getattr(config, "FPS", 30)),
             )
-        return os.path.join(base, config.BOUND_WINDOW_FILE)
+        lead = int(default_lead or 0)
+        path = self._pause_settings_path()
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if "pause_lead_frames" in data:
+                    lead = max(0, int(data["pause_lead_frames"]))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("读取暂停设置失败: %s", e)
+        self.pause_lead_var.set(str(lead))
+        try:
+            self.pause_lead_var.trace_add("write", self._on_pause_lead_changed)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _save_pause_settings(self) -> None:
+        import json
+
+        path = self._pause_settings_path()
+        try:
+            lead = self._get_pause_lead_frames()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"pause_lead_frames": lead}, f, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("保存暂停设置失败: %s", e)
+
+    def _get_pause_lead_frames(self) -> int:
+        """UI 优先；解析失败回退 config。"""
+        try:
+            raw = (self.pause_lead_var.get() or "").strip()
+            if raw != "":
+                return max(0, int(raw))
+        except (TypeError, ValueError, TclError):
+            pass
+        return resolve_lead_frames(
+            lead_frames=getattr(config, "PAUSE_LEAD_FRAMES", 0),
+            lead_ms=getattr(config, "PAUSE_LEAD_MS", 0),
+            logic_fps=getattr(config, "LOGIC_FPS", getattr(config, "FPS", 30)),
+        )
+
+    def _on_pause_lead_changed(self, *_args) -> None:
+        try:
+            lead = self._get_pause_lead_frames()
+            self._save_pause_settings()
+            self._set_pause_status(f"暂停提前: {lead} 帧")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _set_pause_status(self, text: str) -> None:
         self._pause_status = text
@@ -655,40 +912,389 @@ class TimelineApp:
             except TclError:
                 pass
 
-    def _maybe_auto_pause(self, current_frame: int, *, is_running: bool) -> None:
-        events = self.pause_engine.tick(
-            current_frame, self.tracks, is_running=is_running
-        )
-        if not events:
-            return
-        win = resolve_game_window(
-            getattr(config, "GAME_WINDOW_TITLE_KEYWORDS", []),
-            self._bound_window,
-        )
-        hwnd = win["hwnd"] if win else None
-        if not hwnd:
-            self._set_pause_status("暂停: 未找到游戏窗")
-            logger.warning(
-                "触发暂停但未找到游戏窗口（可点「绑定游戏窗」）: %s", events
-            )
-            return
-        hotkey = getattr(config, "PAUSE_HOTKEY", "Space")
-        focus = getattr(config, "FOCUS_GAME_BEFORE_SEND", True)
-        for ev in events:
-            try:
-                send_pause_key(hotkey=hotkey, hwnd=hwnd, focus_before_send=focus)
-                self._set_pause_status(
-                    f"暂停: [{ev['track_name']}] {ev['name']}@{ev['frame']}"
-                )
+    def _resolve_live_game_window(self):
+        """
+        发键前解析活窗（对齐 MAA 每次用当前 hwnd）：
+          1) 刷新绑定（title+class 重枚举，丢弃过期 hwnd）
+          2) 回退 resolve_game_window / 精确标题「明日方舟」
+        若绑定 hwnd 变了会自动写回 bound_game_window.json。
+        """
+        bound = self._bound_window
+        win = None
+        if bound and (bound.title or bound.class_name or bound.hwnd):
+            updated, win = refresh_bound_hwnd(bound)
+            if win and updated.hwnd != (bound.hwnd or 0):
                 logger.info(
-                    "自动暂停: track=%s frame=%s name=%s",
-                    ev["track_name"],
-                    ev["frame"],
-                    ev["name"],
+                    "绑定窗 hwnd 已刷新: %s → %s title=%r class=%r",
+                    bound.hwnd,
+                    updated.hwnd,
+                    updated.title,
+                    updated.class_name,
                 )
-            except Exception as e:  # noqa: BLE001
-                self._set_pause_status(f"暂停失败: {e}")
-                logger.warning("发送暂停键失败: %s", e)
+                self._bound_window = updated
+                try:
+                    save_bound(self._bound_window_path(), updated)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("写回绑定窗失败: %s", e)
+            elif win:
+                self._bound_window = updated
+
+        if not win:
+            win = resolve_game_window(
+                getattr(config, "GAME_WINDOW_TITLE_KEYWORDS", []),
+                self._bound_window,
+            )
+
+        if not win:
+            # 最后再试一次 MAA 精确标题（不依赖绑定/关键字）
+            win = find_maa_pc_client()
+
+        if win:
+            live = describe_hwnd(int(win["hwnd"])) or win
+            logger.info(
+                "发键目标窗: hwnd=%s title=%r class=%r pid=%s size=%sx%s visible=%s minimized=%s",
+                live.get("hwnd"),
+                live.get("title"),
+                live.get("class_name"),
+                live.get("pid"),
+                live.get("width"),
+                live.get("height"),
+                live.get("visible"),
+                live.get("minimized"),
+            )
+            return live
+        return None
+
+    # ------------------------------------------------------------------
+    # 顺序暂停状态机 helpers
+    # ------------------------------------------------------------------
+    def _drop_topmost_for_pause(self) -> None:
+        try:
+            self.root.wm_attributes("-topmost", False)
+            self.root.update_idletasks()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("取消 topmost 失败: %s", e)
+
+    def _restore_topmost_for_pause(self) -> None:
+        try:
+            self.root.wm_attributes("-topmost", True)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("恢复 topmost 失败: %s", e)
+
+    def _event_label(self, event) -> str:
+        """单事件标签：`[轨道名]节点名@节点帧`，有提前量时追加 `(提前N@触发帧)`。"""
+        base = f"[{event.get('track_name', '')}]{event.get('name', '')}@{event.get('frame')}"
+        trig = event.get("trigger_frame")
+        lf = event.get("lead_frames") or 0
+        if lf and trig is not None and trig != event.get("frame"):
+            return f"{base}(提前{lf}@{trig})"
+        return base
+
+    def _group_summary(self, group: PauseGroup) -> str:
+        """一组暂停事件的可读摘要（事件间用 | 连接）。"""
+        return " | ".join(self._event_label(ev) for ev in group.events)
+
+    def _queue_pause_events(self, events) -> list:
+        """把 PauseEngine 本 tick 返回的事件入队；按新增 group 记录日志。"""
+        added = self._pending_pause_groups.add(events)
+        for group in added:
+            logger.info(
+                "暂停节点入队 trigger=%s queue=%d: %s",
+                group.trigger_frame,
+                len(self._pending_pause_groups),
+                self._group_summary(group),
+            )
+        return added
+
+    def _clear_pause_sequence(self, reason: str) -> None:
+        """清空 pending queue、active group、gate、verify，记录原因。"""
+        pending = len(self._pending_pause_groups)
+        self._pending_pause_groups.clear()
+        self._active_pause_group = None
+        self._pause_gate = None
+        self._pause_verify = None
+        self._pause_gate_frame = -1
+        logger.info("清空暂停序列 reason=%s pending=%d", reason, pending)
+
+    def _mark_pause_failed(self, current_frame: int, reason: str) -> None:
+        """当前 active group 发键/校验失败：记录、清 gate/verify/active；不重试。"""
+        v = self._pause_verify if isinstance(self._pause_verify, dict) else None
+        method = (v or {}).get("method_used") or ""
+        trigger = (v or {}).get("trigger_frame")
+        start = (v or {}).get("start_frame")
+        summary = (v or {}).get("summary") or ""
+        logger.warning(
+            "暂停失败 method=%s trigger=%s start=%s current=%s reason=%s summary=%s",
+            method,
+            trigger,
+            start,
+            current_frame,
+            reason,
+            summary,
+        )
+        self._pause_gate = None
+        self._pause_verify = None
+        self._active_pause_group = None
+        self._set_pause_status(f"暂停失败: {reason}")
+
+    def _mark_pause_verified(self, current_frame: int, reason: str) -> None:
+        v = self._pause_verify if isinstance(self._pause_verify, dict) else None
+        method = (v or {}).get("method_used") or ""
+        trigger = (v or {}).get("trigger_frame")
+        start = (v or {}).get("start_frame") if v else None
+        latency = ""
+        if trigger is not None and current_frame >= int(trigger):
+            latency = f" 延迟{current_frame - int(trigger)}帧"
+        self._pause_gate = "frozen"
+        self._pause_gate_frame = current_frame
+        self._pause_verify = None
+        # active group 保留，直到用户恢复时由 _update_pause_gate(frozen 分支) 清空
+        self._set_pause_status(f"已暂停 frame={current_frame}")
+        logger.info(
+            "暂停门闩: 确认停表 frame=%s trigger=%s start=%s method=%s reason=%s%s，"
+            "保留 active 等待用户恢复",
+            current_frame,
+            trigger,
+            start,
+            method,
+            reason,
+            latency,
+        )
+
+    def _dispatch_next_pause_group(self, current_frame: int) -> bool:
+        """
+        派发队首 group：发一次键、进入 verifying。
+
+        - gate 非 None 或队列空 → 返回 False。
+        - 无窗口 → 保留队首，提示并返回 False。
+        - 发键异常 → pop 当前队首（记失败，不重试），返回 False。
+        - 成功 → pop、赋 active、进入 verifying，返回 True。
+        """
+        if self._pause_gate is not None:
+            return False
+        group = self._pending_pause_groups.peek()
+        if group is None:
+            return False
+
+        summary = self._group_summary(group)
+
+        win = self._resolve_live_game_window()
+        if not win or not win.get("hwnd"):
+            self._set_pause_status(f"暂停: 未找到游戏窗 | {summary}")
+            logger.warning(
+                "派发暂停但未找到游戏窗口，保留队首 trigger=%s: %s",
+                group.trigger_frame,
+                summary,
+            )
+            return False
+
+        hwnd = int(win["hwnd"])
+        is_emu = looks_like_emulator_window(
+            win.get("title", ""), win.get("class_name", "")
+        )
+
+        method_used = None
+        try:
+            if is_emu and getattr(config, "ADB_PREFER_FOR_EMULATOR", True):
+                method_used = send_adb_pause_key(getattr(config, "ADB_PAUSE_HOTKEY", "Space"))
+            else:
+                # PC 非管理员警告（文案为 ESC）
+                if (
+                    getattr(config, "PAUSE_REQUIRE_ADMIN_FOR_PC", True)
+                    and not self._is_admin
+                ):
+                    msg = "需管理员运行才能对 PC 客户端发暂停 ESC（右键 exe→以管理员身份运行）"
+                    self._set_pause_status(f"暂停: {msg}")
+                    if not self._admin_warned:
+                        self._admin_warned = True
+                        logger.warning("%s | 触发: %s", msg, summary)
+                        try:
+                            from tkinter import messagebox
+
+                            messagebox.showwarning(
+                                "自动暂停需要管理员",
+                                "已绑定 PC 游戏窗口，但 TimelineTool 未以管理员身份运行。\n\n"
+                                "ESC 暂停键很可能无法送达客户端（UAC 完整性隔离）。\n\n"
+                                "请：关闭本程序 → 右键 TimelineTool.exe →「以管理员身份运行」\n"
+                                "再重新绑定游戏窗后对轴。\n\n"
+                                "（若走模拟器 ADB，可不需要管理员。）",
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug("管理员提示框失败: %s", e)
+                method_used = send_pc_pause_key(
+                    hwnd,
+                    before_focus=self._drop_topmost_for_pause,
+                    after_send=self._restore_topmost_for_pause,
+                    hold_ms=getattr(config, "PC_PAUSE_KEY_HOLD_MS", 50),
+                )
+        except Exception as e:  # noqa: BLE001
+            # 输入 API 异常：pop 当前队首（当前组记失败，避免无限重试），不尝试其他通道
+            failed = self._pending_pause_groups.pop()
+            logger.warning(
+                "派发暂停发送异常，丢弃当前组 trigger=%s reason=%s: %s",
+                getattr(failed, "trigger_frame", None),
+                e,
+                summary,
+            )
+            self._restore_topmost_for_pause()
+            self._pause_gate = None
+            self._pause_verify = None
+            self._active_pause_group = None
+            self._set_pause_status(f"暂停失败: 发送异常 ({e})")
+            return False
+
+        # 成功：pop、赋 active、进入 verifying
+        self._pending_pause_groups.pop()
+        self._active_pause_group = group
+        self._pause_gate = "verifying"
+        self._pause_gate_frame = current_frame
+        import time as _time
+
+        self._pause_verify = {
+            "method_used": method_used,
+            "start_frame": current_frame,
+            "start_ts": _time.monotonic(),
+            "last_frame": current_frame,
+            "stall_count": 0,
+            "stall_since": None,
+            "trigger_frame": group.trigger_frame,
+            "summary": summary,
+        }
+        admin_tag = "" if self._is_admin else " [非管理员]"
+        title_tag = ""
+        if win and win.get("title"):
+            title_tag = f" →{win['title'][:16]}"
+        self._set_pause_status(f"暂停校验 {method_used}{admin_tag}{title_tag}")
+        logger.info(
+            "自动暂停派发 trigger=%s current=%s pending=%d method=%s admin=%s: %s",
+            group.trigger_frame,
+            current_frame,
+            len(self._pending_pause_groups),
+            method_used,
+            self._is_admin,
+            summary,
+        )
+        return True
+
+    def _update_pause_gate(self, current_frame: int) -> None:
+        """
+        发键后的状态机：verifying → frozen → None。
+
+        verifying：用费用尺帧确认「真停」；单帧抖动不算成功。失败调 _mark_pause_failed。
+        frozen：current_frame > gate_frame 视为用户恢复 → 清 gate/verify/active，
+                同轮后续可立即派发队首。
+        """
+        import time as _time
+
+        gate = self._pause_gate
+        if gate is None:
+            return
+
+        if gate == "verifying":
+            v = self._pause_verify if isinstance(self._pause_verify, dict) else None
+            if not v:
+                self._pause_gate = None
+                return
+
+            now = _time.monotonic()
+            start_frame = int(v.get("start_frame") or current_frame)
+            last_frame = int(v.get("last_frame") if v.get("last_frame") is not None else start_frame)
+            timeout = float(getattr(config, "PAUSE_VERIFY_TIMEOUT_SEC", 0.45) or 0.45)
+            need_stall = int(getattr(config, "PAUSE_VERIFY_STALL_UPDATES", 3) or 3)
+            min_stall = float(getattr(config, "PAUSE_GATE_MIN_STALL_SEC", 0.18) or 0.18)
+            fail_advance = int(getattr(config, "PAUSE_VERIFY_FAIL_ADVANCE", 6) or 6)
+
+            advanced = current_frame - start_frame
+            elapsed = now - float(v.get("start_ts") or now)
+
+            if current_frame > last_frame:
+                # 仍在前进
+                v["last_frame"] = current_frame
+                v["stall_count"] = 0
+                v["stall_since"] = None
+                self._pause_gate_frame = current_frame
+                if advanced >= fail_advance:
+                    self._mark_pause_failed(
+                        current_frame, f"前进{advanced}帧>={fail_advance}"
+                    )
+                    return
+                if elapsed >= timeout:
+                    self._mark_pause_failed(
+                        current_frame,
+                        f"超时{timeout:.2f}s仍前进 advanced={advanced}",
+                    )
+                return
+
+            # 帧未增加（相对上一快照）
+            stall_count = int(v.get("stall_count") or 0) + 1
+            v["stall_count"] = stall_count
+            v["last_frame"] = current_frame
+            if v.get("stall_since") is None:
+                v["stall_since"] = now
+            stall_for = now - float(v["stall_since"])
+            self._pause_gate_frame = current_frame
+
+            if stall_count >= need_stall and stall_for >= min_stall:
+                self._mark_pause_verified(
+                    current_frame,
+                    f"stall×{stall_count}/{need_stall} ≥{min_stall:.2f}s",
+                )
+                return
+
+            if elapsed >= timeout:
+                # 费用尺可能只在变帧时推送：发键后几乎不前进却迟迟凑不够 stall 样本
+                # 绝不能再发键（会取消已成功的暂停）。把「几乎没前进」当成功。
+                if advanced <= 1:
+                    self._mark_pause_verified(
+                        current_frame,
+                        f"超时且几乎未前进 advanced={advanced} stall={stall_count}",
+                    )
+                else:
+                    self._mark_pause_failed(
+                        current_frame,
+                        f"超时未稳定停表 advanced={advanced} stall={stall_count}",
+                    )
+            return
+
+        if gate == "frozen":
+            if current_frame > self._pause_gate_frame:
+                pending = len(self._pending_pause_groups)
+                logger.info(
+                    "用户恢复 frame=%s trigger_gate=%s pending=%d，允许处理下一节点",
+                    current_frame,
+                    self._pause_gate_frame,
+                    pending,
+                )
+                self._pause_gate = None
+                self._pause_verify = None
+                self._active_pause_group = None
+            else:
+                # 未恢复：只更新/保持 gate frame，不派发
+                self._pause_gate_frame = current_frame
+
+    def _maybe_auto_pause(self, current_frame: int, *, is_running: bool) -> None:
+        # 1) 大幅帧回退 → 清空整个暂停序列（队列/active/gate/verify）
+        last = self.pause_engine.last_frame
+        if last is not None and current_frame + self.pause_engine.reset_threshold < last:
+            self._clear_pause_sequence(f"费用尺帧回退 {last}->{current_frame}")
+
+        # 2) 推进门闩 / 校验（frozen 恢复会在本步把 gate 清成 None）
+        self._update_pause_gate(current_frame)
+
+        # 3) 收集本 tick 事件并全部入队（gate 非空也不能阻止入队，防事件丢失）
+        events = self.pause_engine.tick(
+            current_frame,
+            self.tracks,
+            is_running=is_running,
+            lead_frames=self._get_pause_lead_frames(),
+        )
+        if events:
+            self._queue_pause_events(events)
+
+        # 4) gate 非空时只入队不派发；否则派发队首
+        if self._pause_gate is not None:
+            return
+        self._dispatch_next_pause_group(current_frame)
 
     def _bind_game_window_click(self) -> None:
         """倒计时后取光标下窗口并保存绑定。"""
@@ -726,8 +1332,61 @@ class TimelineApp:
             except Exception as e:  # noqa: BLE001
                 logger.warning("保存绑定失败: %s", e)
             short = bound.title[:24] + ("…" if len(bound.title) > 24 else "")
-            self._set_pause_status(f"暂停: 已绑 {short}")
-            logger.info("已绑定游戏窗: %s", bound)
+            # 绑定 PC 客户端时检查管理员
+            is_emu = False
+            try:
+                from adb_input import looks_like_emulator_window
+
+                is_emu = looks_like_emulator_window(
+                    bound.title, bound.class_name
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # 对照 MAA：PC 客户端应是标题精确「明日方舟」+ UnityWndClass
+            is_maa_pc = bound.title in ("明日方舟", "Arknights") and (
+                not bound.class_name or bound.class_name == "UnityWndClass"
+            )
+            if (
+                not is_emu
+                and getattr(config, "PAUSE_REQUIRE_ADMIN_FOR_PC", True)
+                and not self._is_admin
+            ):
+                self._set_pause_status(
+                    f"已绑 {short} | 非管理员，PC 暂停可能无效"
+                )
+                logger.warning(
+                    "已绑定 PC 窗但未管理员: %s — 自动暂停可能被 UIPI 拦截",
+                    bound,
+                )
+                try:
+                    from tkinter import messagebox
+
+                    messagebox.showwarning(
+                        "建议以管理员运行",
+                        f"已绑定：{bound.title}\n\n"
+                        "这是 PC 游戏窗口。未以管理员身份运行时，\n"
+                        "自动暂停（Space）常常无法送达客户端。\n\n"
+                        "请右键 TimelineTool.exe →「以管理员身份运行」后重试。\n"
+                        "模拟器 + ADB 路径一般不需要管理员。",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                tag = " [MAA-PC]" if is_maa_pc else (" [模拟器]" if is_emu else "")
+                self._set_pause_status(f"暂停: 已绑 {short}{tag}")
+            logger.info(
+                "已绑定游戏窗: hwnd=%s title=%r class=%r pid=%s size=%sx%s "
+                "admin=%s emu=%s maa_pc=%s",
+                bound.hwnd,
+                bound.title,
+                bound.class_name,
+                win.get("pid"),
+                win.get("width"),
+                win.get("height"),
+                self._is_admin,
+                is_emu,
+                is_maa_pc,
+            )
 
         # 3 秒后采样（期间用户把鼠标移到目标窗）
         self.root.after(3000, _finish)
@@ -773,27 +1432,24 @@ class TimelineApp:
         else:
             self._apply_track_zoom(-0.1)
 
-    def _on_key_left(self, event):
-        """左箭头：向左移动时间轴；若处于吸附状态则自动解除。"""
-        if self.is_time_flowing:
+    def _move_timeline_by_frames(self, frame_delta, *, track=None) -> None:
+        """手动移动时间轴；键盘与轨道滚轮共用同一帧步进。"""
+        if self.is_time_flowing or not frame_delta:
             return
-        active = self.active_track
-        if active and active.magnet_mode.get():
-            active.magnet_mode.set(False)
-            logger.info("通过左箭头键解除磁铁吸附。")
-        self.timeline_offset -= config.KEYBOARD_SCROLL_STEP
+        target = track or self.active_track
+        if target and target.magnet_mode.get():
+            target.magnet_mode.set(False)
+            logger.info("手动移动时间轴，解除磁铁吸附。")
+        self.timeline_offset += frame_delta
         self._update_display()
 
+    def _on_key_left(self, event):
+        """左箭头：向左移动一个逻辑帧。"""
+        self._move_timeline_by_frames(-config.KEYBOARD_SCROLL_STEP)
+
     def _on_key_right(self, event):
-        """右箭头：向右移动时间轴；若处于吸附状态则自动解除。"""
-        if self.is_time_flowing:
-            return
-        active = self.active_track
-        if active and active.magnet_mode.get():
-            active.magnet_mode.set(False)
-            logger.info("通过右箭头键解除磁铁吸附。")
-        self.timeline_offset += config.KEYBOARD_SCROLL_STEP
-        self._update_display()
+        """右箭头：向右移动一个逻辑帧。"""
+        self._move_timeline_by_frames(config.KEYBOARD_SCROLL_STEP)
 
     def _apply_global_zoom(self, delta):
         """统一调整所有轨道的缩放比例，使所有轨道倍率完全一致。"""
@@ -838,8 +1494,7 @@ class TimelineApp:
             return
 
         if active.mode.get() == "打轴模式":
-            # 打轴模式自动关闭磁铁，让用户自由移动时间轴
-            active.magnet_mode.set(False)
+            # 打轴：保留磁铁状态（开=蓝线跟费用尺，关=可自由拖；可用「回正」）
             self._create_editing_buttons()
         else:
             # 对轴模式强制开启吸附
@@ -911,46 +1566,108 @@ class TimelineApp:
         return btn
 
     def _create_editing_buttons(self):
-        """为“打轴模式”创建操作按钮。"""
+        """为“打轴模式”创建操作按钮（打开/保存已移至顶栏）。"""
         frame = self.dynamic_ops_frame
         active = self.active_track
-        self._create_grid_button(frame, 0, 0, "打开", "open", self._load_timeline)
-        self._create_grid_button(frame, 0, 1, "保存", "save", self._save_timeline)
-        self.add_remove_btn = self._create_grid_button(frame, 0, 2, "添加/移除", "add",
-                                                       active.add_or_remove_node_at_cursor)
-        self._create_grid_button(frame, 1, 0, "切换颜色", "color", active.change_node_color_at_cursor)
-        self._create_grid_button(frame, 1, 1, "重命名", "rename", active.rename_node_at_cursor)
+        self.add_remove_btn = self._create_grid_button(
+            frame, 0, 0, "添加/移除", "add", active.add_or_remove_node_at_cursor
+        )
+        self._create_grid_button(frame, 0, 1, "切换颜色", "color", active.change_node_color_at_cursor)
+        self._create_grid_button(frame, 0, 2, "节点配置", "rename", active.configure_node_at_cursor)
 
         def on_magnet_toggle():
             if not active.magnet_mode.get():
                 self.timeline_offset = self.current_game_frame
                 logger.debug(f"手动关闭磁铁模式，时间轴位置同步到: {self.timeline_offset}")
+            self._mark_dirty()
 
-        self._create_grid_toggle_button(frame, 1, 2, "磁铁: 开", "磁铁: 关", active.magnet_mode, "magnet_on",
-                                        "magnet_off", command=on_magnet_toggle)
+        self._create_grid_toggle_button(
+            frame, 1, 0, "磁铁: 开", "磁铁: 关", active.magnet_mode,
+            "magnet_on", "magnet_off", command=on_magnet_toggle,
+        )
+        self._create_track_pause_toggle(frame, 1, 1, active)
+
+    def _create_lead_controls(self, parent, active) -> None:
+        """提醒提前与暂停提前各占一行，避免窄操作面板横向截断。"""
+        alert_row = ttk.Frame(parent, style="TFrame")
+        alert_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            alert_row,
+            text="提醒提前(帧):",
+            font=(config.FONT_FAMILY, self.scaled_font_normal),
+        ).pack(side=LEFT, padx=self.scaled_pad_m)
+        alert_spin = ttk.Spinbox(
+            alert_row,
+            from_=0,
+            to_=300,
+            textvariable=active.alert_lead_var,
+            width=5,
+        )
+        alert_spin.pack(side=LEFT, padx=self.scaled_pad_m)
+        alert_spin.bind("<Return>", lambda e: None)
+
+        pause_row = ttk.Frame(parent, style="TFrame")
+        pause_row.grid(row=1, column=0, sticky="w", pady=(self.scaled_pad_s, 0))
+        ttk.Label(
+            pause_row,
+            text="暂停提前(帧):",
+            font=(config.FONT_FAMILY, self.scaled_font_normal),
+        ).pack(side=LEFT, padx=self.scaled_pad_m)
+        pause_spin = ttk.Spinbox(
+            pause_row,
+            from_=0,
+            to_=30,
+            textvariable=self.pause_lead_var,
+            width=4,
+        )
+        pause_spin.pack(side=LEFT, padx=self.scaled_pad_m)
+        pause_spin.bind("<Return>", lambda e: self._on_pause_lead_changed())
+        pause_spin.bind("<FocusOut>", lambda e: self._on_pause_lead_changed())
 
     def _create_following_buttons(self):
         """为“对轴模式”创建操作按钮。"""
         frame = self.dynamic_ops_frame
         active = self.active_track
-        self._create_grid_button(frame, 0, 0, "打开", "open", self._load_timeline)
-        self._create_grid_toggle_button(frame, 0, 1, "声音提醒: 开", "声音提醒: 关", active.sound_alert_enabled,
-                                        "sound_on", "sound_off")
-        self._create_grid_toggle_button(frame, 0, 2, "视觉提醒: 开", "视觉提醒: 关", active.visual_alert_enabled,
-                                        "visual_on", "visual_off")
-        lead_frame = ttk.Frame(frame, style="TFrame")
-        lead_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(self.scaled_pad_xl, 0))
-        ttk.Label(lead_frame, text="提醒提前(帧):", font=(config.FONT_FAMILY, self.scaled_font_normal)).pack(
-            side=LEFT, padx=self.scaled_pad_m)
-        spinbox = ttk.Spinbox(
-            lead_frame,
-            from_=0,
-            to_=300,
-            textvariable=active.alert_lead_var,
-            width=5
+        self._create_grid_toggle_button(
+            frame, 0, 0, "声音提醒: 开", "声音提醒: 关", active.sound_alert_enabled,
+            "sound_on", "sound_off",
         )
-        spinbox.pack(side=LEFT, padx=self.scaled_pad_m)
-        spinbox.bind('<Return>', lambda e: None)  # TimelineTrack 内部已处理 trace
+        self._create_grid_toggle_button(
+            frame, 0, 1, "视觉提醒: 开", "视觉提醒: 关", active.visual_alert_enabled,
+            "visual_on", "visual_off",
+        )
+        self._create_track_pause_toggle(frame, 0, 2, active)
+
+        self._create_grid_button(frame, 1, 0, "节点配置", "rename", active.configure_node_at_cursor)
+
+        lead_frame = ttk.Frame(frame, style="TFrame")
+        lead_frame.grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(self.scaled_pad_xl, 0),
+        )
+        self._create_lead_controls(lead_frame, active)
+
+    def _create_track_pause_toggle(self, parent, r, c, active):
+        """轨道自动暂停总闸（对轴生效）。专用暂停图标，不用喇叭。"""
+        def on_toggle():
+            self._mark_dirty()
+            state = "开" if active.pause_enabled.get() else "关"
+            self._set_pause_status(f"轨暂停: {state} [{active.name}]")
+            try:
+                active.update_display()
+            except Exception:  # noqa: BLE001
+                self._update_display()
+
+        self._create_grid_toggle_button(
+            parent, r, c,
+            "轨暂停: 开", "轨暂停: 关",
+            active.pause_enabled,
+            "pause_on", "pause_off",
+            command=on_toggle,
+        )
 
     # ------------------------------------------------------------------
     # Drag / Resize events
@@ -1058,10 +1775,13 @@ class TimelineApp:
 
     def _on_window_drag_start(self, event):
         """处理窗口拖动的开始事件。使用屏幕坐标避免抖动。"""
+        self._window_dragging = True
         self._window_drag_data = {"x": event.x_root, "y": event.y_root}
 
     def _on_window_drag_motion(self, event):
         """处理窗口的拖动事件。使用屏幕坐标避免抖动。"""
+        if not self._window_dragging or not self._window_drag_data:
+            return
         dx = event.x_root - self._window_drag_data["x"]
         dy = event.y_root - self._window_drag_data["y"]
         x = self.root.winfo_x() + dx
@@ -1069,6 +1789,114 @@ class TimelineApp:
         self.root.geometry(f"+{x}+{y}")
         self._window_drag_data["x"] = event.x_root
         self._window_drag_data["y"] = event.y_root
+
+    # 这些控件自身要处理点击，不启动窗口拖动
+    _NO_WINDOW_DRAG_CLASSES = {
+        "Button", "TButton", "Entry", "TEntry", "Spinbox", "TSpinbox",
+        "Canvas", "TRadiobutton", "Radiobutton", "TCheckbutton", "Checkbutton",
+        "TCombobox", "Listbox", "Text", "Scrollbar", "TScrollbar",
+        "Scale", "TScale",
+    }
+
+    def _widget_blocks_window_drag(self, widget) -> bool:
+        """
+        是否禁止拖窗：
+        - 缩放条 / 显式 _no_hud_drag
+        - 按钮、时间轴画布、输入框等
+        顶栏 _hud_drag_zone 内的空白允许拖（按钮仍拦截）。
+        """
+        cur = widget
+        in_drag_zone = False
+        while cur is not None:
+            try:
+                if getattr(cur, "_no_hud_drag", False):
+                    return True
+                if getattr(cur, "_hud_drag_zone", False):
+                    in_drag_zone = True
+            except Exception:  # noqa: BLE001
+                pass
+            # 底部/右侧缩放条整棵子树禁止拖窗
+            if cur is getattr(self, "bottom_resize_handle", None):
+                return True
+            if cur is getattr(self, "right_resize_handle", None):
+                return True
+            try:
+                cls = cur.winfo_class()
+            except tk.TclError:
+                break
+            if cls in self._NO_WINDOW_DRAG_CLASSES:
+                return True
+            try:
+                cur = cur.master
+            except tk.TclError:
+                break
+        # 只有显式标记的顶栏/迷你栏空白区可拖动；其它普通标签和 Frame
+        # 可能承载点击交互，均应放行给自身。
+        return not in_drag_zone
+
+    def _on_global_window_press(self, event):
+        """全局左键：空白处开始拖窗，交互控件与缩放条放行。"""
+        try:
+            if event.widget.winfo_toplevel() is not self.root:
+                self._window_dragging = False
+                return
+        except tk.TclError:
+            self._window_dragging = False
+            return
+        if self._widget_blocks_window_drag(event.widget):
+            self._window_dragging = False
+            self._window_drag_data = None
+            return
+        self._on_window_drag_start(event)
+
+    def _on_global_window_motion(self, event):
+        if self._window_dragging:
+            self._on_window_drag_motion(event)
+
+    def _on_global_window_release(self, event):
+        self._window_dragging = False
+
+    def _minimize_window(self):
+        """最小化：只保留细条（恢复 / 关闭）。"""
+        if self._minimized:
+            return
+        self._minimized = True
+        try:
+            self._restore_geometry = self.root.geometry()
+        except tk.TclError:
+            self._restore_geometry = None
+        # 收起主界面
+        try:
+            self._main_frame.pack_forget()
+        except Exception:  # noqa: BLE001
+            pass
+        bar_h = max(28, int(28 * self.scaling_factor))
+        bar_w = max(160, int(180 * self.scaling_factor))
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        self._mini_bar.pack(fill=X, padx=self.scaled_pad_s, pady=self.scaled_pad_s)
+        self.root.geometry(f"{bar_w}x{bar_h}+{x}+{y}")
+        logger.info("窗口已最小化")
+
+    def _restore_window(self):
+        """从最小化细条恢复完整 HUD。"""
+        if not self._minimized:
+            return
+        self._minimized = False
+        try:
+            self._mini_bar.pack_forget()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._main_frame.pack(expand=True, fill=BOTH)
+        except Exception:  # noqa: BLE001
+            pass
+        if self._restore_geometry:
+            self.root.geometry(self._restore_geometry)
+        else:
+            self.root.geometry(f"{self.scaled_win_width}x{self.scaled_win_height}")
+        self._update_display()
+        logger.info("窗口已恢复")
 
     # ------------------------------------------------------------------
     # File I/O
