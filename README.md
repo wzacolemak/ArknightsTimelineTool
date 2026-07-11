@@ -2,7 +2,7 @@
 
 一个配合明日方舟费用尺使用的独立打轴器。它会读取费用尺的实时帧数，帮助记录操作节点、对照时间轴，并在需要时自动暂停游戏。
 
-本项目从 [duke4994/ArknightsCostBarRuler_-](https://github.com/duke4994/ArknightsCostBarRuler_-) 的 `timeline_tool` 分离而来。原项目已经提供多轨时间轴、节点提醒、干员头像和费用尺模拟器支持；这个 Fork 主要做了三件事：
+本项目从 [duke4994/ArknightsCostBarRuler_-](https://github.com/duke4994/ArknightsCostBarRuler_-) 的 `timeline_tool` 分离而来。原项目已经提供多轨时间轴、节点提醒、干员头像和费用尺模拟器支持，改动如下
 
 - 独立发布打轴器，不再打包原费用尺。
 - 对接新版 Rust 费用尺。
