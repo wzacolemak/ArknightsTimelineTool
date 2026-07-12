@@ -8,7 +8,6 @@ from PIL import Image, ImageDraw, ImageTk
 
 import config
 from utils import format_frame_time
-from operator_portrait_manager import OperatorPortraitManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +59,6 @@ class TimelineTrack:
         self.last_sound_alert_frame = -1
         self.is_flashing = False
         self._flash_after_id = None
-        self._portrait_images = []  # 防止 PhotoImage 被垃圾回收
         self._node_image_cache = {}  # 抗锯齿菱形缓存，避免每帧重复生成
 
         self.mode = tk.StringVar(value="打轴模式")
@@ -68,19 +66,11 @@ class TimelineTrack:
         self.magnet_locked = False  # 尺子时间流动时锁定吸附，禁止拖拽解除
         self._magnet_unlock_log_done = False  # 防止解锁日志在同一周期内重复输出
         self.track_zoom = 1.0  # 单轨道缩放比例
-        self.sound_alert_enabled = tk.BooleanVar(value=True)
-        self.visual_alert_enabled = tk.BooleanVar(value=True)
         # 总闸：本轨节点是否允许到点自动暂停（默认开）
         self.pause_enabled = tk.BooleanVar(
             value=bool(getattr(config, "PAUSE_ENABLED_DEFAULT", True))
         )
-        self.alert_lead_frames = {"sound": 60, "visual": 60}
-        self.alert_lead_var = tk.StringVar()
-        self.alert_lead_var.set(str(self.alert_lead_frames["visual"]))
-        self.alert_lead_var.trace_add("write", self._on_alert_lead_changed)
-
         self.name = default_name
-        self.portrait_mgr = OperatorPortraitManager(self.app.scaling_factor)
         self._setup_ui(parent_frame)
 
         if track_data:
@@ -107,12 +97,6 @@ class TimelineTrack:
 
         self.magnet_indicator = ttk.Label(self.title_bar, text="", style="Info.TLabel")
         self.magnet_indicator.pack(side=tk.LEFT, padx=self.app.scaled_pad_m)
-
-        self.sound_indicator = ttk.Label(self.title_bar, text="", style="Info.TLabel")
-        self.sound_indicator.pack(side=tk.LEFT, padx=self.app.scaled_pad_m)
-
-        self.visual_indicator = ttk.Label(self.title_bar, text="", style="Info.TLabel")
-        self.visual_indicator.pack(side=tk.LEFT, padx=self.app.scaled_pad_m)
 
         # --- Info frame（必须在 Canvas 之前 pack，否则 expand=True 的 Canvas 会抢占全部空间） ---
         self.info_frame = ttk.Frame(self.frame, style="TFrame")
@@ -180,11 +164,6 @@ class TimelineTrack:
         self.name_label.config(text=self.name)
         self.mode.set(data.get("mode", "打轴模式"))
         self.magnet_mode.set(data.get("magnet_mode", True))
-        self.sound_alert_enabled.set(data.get("sound_alert_enabled", True))
-        self.visual_alert_enabled.set(data.get("visual_alert_enabled", True))
-        self.alert_lead_frames["sound"] = data.get("alert_lead_frames", 60)
-        self.alert_lead_frames["visual"] = data.get("alert_lead_frames", 60)
-        self.alert_lead_var.set(str(self.alert_lead_frames["visual"]))
         self.pause_enabled.set(bool(data.get("pause_enabled", True)))
         raw_nodes = data.get("nodes", data.get("timeline_data", [])) or []
         # 节点补 pause_on_arrive 默认
@@ -202,9 +181,6 @@ class TimelineTrack:
             "name": self.name,
             "mode": self.mode.get(),
             "magnet_mode": self.magnet_mode.get(),
-            "sound_alert_enabled": self.sound_alert_enabled.get(),
-            "visual_alert_enabled": self.visual_alert_enabled.get(),
-            "alert_lead_frames": self.alert_lead_frames["visual"],
             "pause_enabled": bool(self.pause_enabled.get()),
             "nodes": copy.deepcopy(self.timeline_data)
         }
@@ -342,7 +318,6 @@ class TimelineTrack:
         center_frame = self.get_center_frame()
         canvas = self.canvas
         canvas.delete("all")
-        self._portrait_images.clear()
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
@@ -380,30 +355,9 @@ class TimelineTrack:
             # 截断节点名称，避免 info_frame 中各列重叠
             display_name = self._truncate_node_name(node_to_display['name'])
 
-            # compact_level >= 2 时，info_name_label 也支持头像替换
-            if compact_level >= 2 and self.portrait_mgr:
-                parsed_name, portrait_path = self.portrait_mgr.parse_name(display_name)
-                if portrait_path:
-                    photo = self.portrait_mgr.get_image(portrait_path)
-                    if photo:
-                        self._portrait_images.append(photo)
-                        display_text = self._truncate_node_name(parsed_name)
-                        self.info_name_label.config(
-                            image=photo,
-                            text=f" {display_text}({format_frame_time(node_to_display['frame'])})"
-                        )
-                    else:
-                        self.info_name_label.config(
-                            image="", text=f" {display_name}({format_frame_time(node_to_display['frame'])})"
-                        )
-                else:
-                    self.info_name_label.config(
-                        image="", text=f" {display_name}({format_frame_time(node_to_display['frame'])})"
-                    )
-            else:
-                self.info_name_label.config(
-                    image="", text=f" {display_name}({format_frame_time(node_to_display['frame'])})"
-                )
+            self.info_name_label.config(
+                image="", text=f" {display_name}({format_frame_time(node_to_display['frame'])})"
+            )
 
             # 精确到帧才显示"现在"
             if node_on_cursor and node_on_cursor['frame'] == center_frame:
@@ -412,7 +366,7 @@ class TimelineTrack:
                 # 预告：始终基于 current_next_node（真正的"下个节点"）
                 next_node = self.current_next_node
                 time_to_next = next_node['frame'] - center_frame if next_node else -1
-                lead = self.alert_lead_frames["visual"]
+                lead = self._global_alert_value("alert_lead_frames")
                 if (self.mode.get() == "对轴模式" and next_node and
                         0 < time_to_next <= lead):
                     self.info_remaining_label.config(
@@ -432,8 +386,6 @@ class TimelineTrack:
         # 标题栏状态指示
         self.mode_indicator.config(text="对轴" if self.mode.get() == "对轴模式" else "打轴")
         self.magnet_indicator.config(text="磁铁" if self.magnet_mode.get() else "")
-        self.sound_indicator.config(text="🔊" if self.sound_alert_enabled.get() else "")
-        self.visual_indicator.config(text="👁" if self.visual_alert_enabled.get() else "")
         # 轨道暂停总闸（对轴时有意义）
         pause_on = bool(self.pause_enabled.get()) if hasattr(self.pause_enabled, "get") else bool(self.pause_enabled)
         if not hasattr(self, "pause_indicator"):
@@ -589,21 +541,14 @@ class TimelineTrack:
         occupied = []
         for node, x_pos in visible_nodes:
             raw_text = node["name"]
-            display_text, portrait_path = self.portrait_mgr.parse_name(raw_text) if self.portrait_mgr else (raw_text, None)
-            portrait_size = self.portrait_mgr.portrait_size if self.portrait_mgr else 0
-            portrait_spacing = 4  # 头像与文字之间的间距
 
             # 计算文本宽度
             if fnt:
-                text_w = fnt.measure(display_text) if display_text else 0
+                text_w = fnt.measure(raw_text) if raw_text else 0
             else:
-                text_w = len(display_text) * self.app.scaled_font_normal * 0.6 if display_text else 0
+                text_w = len(raw_text) * self.app.scaled_font_normal * 0.6 if raw_text else 0
 
-            # 总宽度 = 头像宽度(如有) + 间距 + 文字宽度
-            total_w = text_w
-            if portrait_path:
-                total_w = portrait_size + portrait_spacing + text_w
-            half_w = total_w / 2 + padding
+            half_w = text_w / 2 + padding
             left, right = x_pos - half_w, x_pos + half_w
 
             # 检查是否超出画布边界
@@ -622,30 +567,9 @@ class TimelineTrack:
             h = self.app.scaled_node_diamond_h * (config.NODE_SELECTED_SCALE if node == node_on_cursor else 1.0)
             base_y = height / 2 + (h + self.app.scaled_node_name_offset)
 
-            if portrait_path:
-                photo = self.portrait_mgr.get_image(portrait_path)
-                if photo:
-                    self._portrait_images.append(photo)
-                    # 头像 + 文字水平居中排列
-                    # 总内容从 (x_pos - total_w/2) 到 (x_pos + total_w/2)
-                    start_x = x_pos - total_w / 2
-                    img_x = start_x + portrait_size / 2
-                    # 头像中心与文字顶部齐平，允许向上覆盖时间轴
-                    canvas.create_image(img_x, base_y, image=photo, anchor="center")
-                    if display_text:
-                        text_x = start_x + portrait_size + portrait_spacing + text_w / 2
-                        canvas.create_text(text_x, base_y, text=display_text, fill="white",
-                                           font=(config.FONT_FAMILY, self.app.scaled_font_normal),
-                                           anchor="n")
-                else:
-                    # 头像加载失败，回退到纯文字
-                    canvas.create_text(x_pos, base_y, text=raw_text, fill="white",
-                                       font=(config.FONT_FAMILY, self.app.scaled_font_normal),
-                                       anchor="n")
-            else:
-                canvas.create_text(x_pos, base_y, text=raw_text, fill="white",
-                                   font=(config.FONT_FAMILY, self.app.scaled_font_normal),
-                                   anchor="n")
+            canvas.create_text(x_pos, base_y, text=raw_text, fill="white",
+                               font=(config.FONT_FAMILY, self.app.scaled_font_normal),
+                               anchor="n")
             occupied.append((left, right))
 
     def _draw_playhead(self, canvas, center_frame, width, height, pixels_per_frame):
@@ -782,17 +706,6 @@ class TimelineTrack:
             return name
         return name[:max_chars - 1] + "…"
 
-    def _on_alert_lead_changed(self, *args):
-        try:
-            frames_str = self.alert_lead_var.get()
-            if frames_str:
-                frames = int(frames_str)
-                frames = max(0, min(frames, 300))
-                self.alert_lead_frames["sound"] = frames
-                self.alert_lead_frames["visual"] = frames
-        except (ValueError, TclError):
-            pass
-
     def _rename_track(self, event=None):
         new_name = simpledialog.askstring("重命名轨道", "输入新名称:",
                                           initialvalue=self.name,
@@ -806,6 +719,21 @@ class TimelineTrack:
     # ------------------------------------------------------------------
     # Alerts
     # ------------------------------------------------------------------
+    def _global_alert_value(self, name):
+        variables = {
+            "sound_enabled": "sound_alert_enabled",
+            "visual_enabled": "visual_alert_enabled",
+            "alert_lead_frames": "alert_lead_var",
+        }
+        variable = getattr(self.app, variables[name])
+        value = variable.get()
+        if name == "alert_lead_frames":
+            try:
+                return max(0, min(300, int(value)))
+            except (TypeError, ValueError, TclError):
+                return 60
+        return bool(value)
+
     def _handle_alerts(self, time_to_next, node_frame):
         try:
             import winsound
@@ -813,13 +741,14 @@ class TimelineTrack:
         except ImportError:
             HAS_WINSOUND = False
 
-        if HAS_WINSOUND and self.sound_alert_enabled.get() and \
-                0 < time_to_next <= self.alert_lead_frames["sound"] and \
+        lead_frames = self._global_alert_value("alert_lead_frames")
+        if HAS_WINSOUND and self._global_alert_value("sound_enabled") and \
+                0 < time_to_next <= lead_frames and \
                 self.last_sound_alert_frame != node_frame:
             winsound.PlaySound("SystemAsterisk", winsound.SND_ASYNC)
             self.last_sound_alert_frame = node_frame
 
-        should_be_flashing = self.visual_alert_enabled.get() and 0 < time_to_next <= self.alert_lead_frames["visual"]
+        should_be_flashing = self._global_alert_value("visual_enabled") and 0 < time_to_next <= lead_frames
 
         if should_be_flashing and not self.is_flashing:
             self.is_flashing = True

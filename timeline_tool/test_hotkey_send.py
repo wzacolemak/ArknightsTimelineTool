@@ -227,7 +227,8 @@ class TestPcPauseInput(unittest.TestCase):
     # 必需接口存在。
     def test_required_public_api_present(self):
         self.assertTrue(callable(getattr(hotkey_send, "send_pc_pause_key", None)))
-        self.assertTrue(callable(getattr(hotkey_send, "send_adb_pause_key", None)))
+        self.assertTrue(callable(getattr(hotkey_send, "send_adb_pause_tap", None)))
+        self.assertFalse(hasattr(hotkey_send, "send_adb_pause_key"))
         self.assertTrue(callable(getattr(hotkey_send, "is_elevated", None)))
         self.assertTrue(callable(getattr(hotkey_send, "_load_user32", None)))
 
@@ -445,19 +446,17 @@ class TestSeizeAndFallback(unittest.TestCase):
             self.assertFalse(hotkey_send.is_elevated())
 
 
-class TestAdbPauseKey(unittest.TestCase):
-    # 5. ADB 成功行为。
-    @patch("hotkey_send._try_adb_pause", return_value=True)
+class TestAdbPauseTap(unittest.TestCase):
+    @patch("hotkey_send._try_adb_pause_tap", return_value=(1200, 50))
     def test_adb_success(self, adb_pause):
-        result = hotkey_send.send_adb_pause_key("Space")
-        adb_pause.assert_called_once_with("Space")
-        self.assertEqual(result, "ADB(Space)")
+        result = hotkey_send.send_adb_pause_tap()
+        adb_pause.assert_called_once_with()
+        self.assertEqual(result, "ADB(Tap 1200,50)")
 
-    # 5. ADB 失败抛 OSError。
-    @patch("hotkey_send._try_adb_pause", return_value=False)
+    @patch("hotkey_send._try_adb_pause_tap", return_value=None)
     def test_adb_failure_raises_oserror(self, adb_pause):
         with self.assertRaises(OSError):
-            hotkey_send.send_adb_pause_key("Space")
+            hotkey_send.send_adb_pause_tap()
         adb_pause.assert_called_once()
 
 
@@ -467,10 +466,10 @@ class TestConfigConverged(unittest.TestCase):
         import config
 
         self.assertEqual(getattr(config, "PC_PAUSE_HOTKEY"), "Escape")
-        self.assertEqual(getattr(config, "ADB_PAUSE_HOTKEY"), "Space")
         self.assertEqual(getattr(config, "PC_PAUSE_KEY_HOLD_MS"), 50)
         self.assertEqual(getattr(config, "FOCUS_GAME_BEFORE_SEND"), True)
         self.assertEqual(getattr(config, "PAUSE_ENABLED_DEFAULT"), True)
+        self.assertEqual(getattr(config, "PAUSE_LEAD_FRAMES"), 1)
         self.assertEqual(getattr(config, "PAUSE_REQUIRE_ADMIN_FOR_PC"), True)
 
     def test_old_pc_pause_keys_removed(self):
@@ -492,11 +491,16 @@ class TestConfigConverged(unittest.TestCase):
             "PAUSE_LEAD_FRAMES",
             "PAUSE_LEAD_MS",
             "ADB_SERIAL",
-            "ADB_KEYEVENT",
         ):
             self.assertTrue(
                 hasattr(config, key), f"config 缺少保留键 {key}"
             )
+
+    def test_obsolete_adb_keyevent_settings_removed(self):
+        import config
+
+        self.assertFalse(hasattr(config, "ADB_PAUSE_HOTKEY"))
+        self.assertFalse(hasattr(config, "ADB_KEYEVENT"))
 
 
 if __name__ == "__main__":

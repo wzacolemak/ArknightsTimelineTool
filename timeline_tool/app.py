@@ -35,8 +35,17 @@ from game_window import (
     find_maa_pc_client,
     describe_hwnd,
 )
-from hotkey_send import is_elevated, send_adb_pause_key, send_pc_pause_key
+from hotkey_send import is_elevated, send_adb_pause_tap, send_pc_pause_key
 from adb_input import looks_like_emulator_window
+from emulator_detector import candidate_adb_paths, detect_adb
+from settings_manager import (
+    DEFAULT_SHORTCUTS,
+    get_setting,
+    load_settings,
+    migrate_legacy_settings,
+    save_settings,
+    set_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +126,24 @@ class TimelineApp:
         self.root = root
         self._autoload_path = autoload_path
 
+        # --- 全局设置（旧 pause_settings.json 仅在首次启动时迁移） ---
+        settings_path = self._settings_path()
+        self._settings_was_missing = not os.path.isfile(settings_path)
+        self.settings = migrate_legacy_settings(
+            settings_path,
+            self._pause_settings_path(),
+            open_file if open_file and os.path.isfile(open_file) else None,
+            persist=not self._settings_was_missing or bool(open_file and os.path.isfile(open_file)),
+        )
+        if open_file and os.path.isfile(open_file):
+            self._settings_was_missing = False
+        self._auto_detect_adb_if_needed()
+        alerts = self.settings["alerts"]
+        self.sound_alert_enabled = tk.BooleanVar(master=root, value=alerts["sound_enabled"])
+        self.visual_alert_enabled = tk.BooleanVar(master=root, value=alerts["visual_enabled"])
+        self.alert_lead_var = tk.StringVar(master=root, value=str(alerts["alert_lead_frames"]))
+        self.pause_lead_var = tk.StringVar(master=root, value=str(alerts["pause_lead_frames"]))
+
         # --- 基于缩放比例计算所有UI尺寸 ---
         self.scaling_factor = scaling_factor
         self.global_zoom = 1.0
@@ -178,9 +205,6 @@ class TimelineApp:
         self._admin_warned = False
         self._duplicate_ruler_warned = False
         self._is_admin = is_elevated()
-        # 暂停提前帧（全局，操作面板 Spinbox；持久化 pause_settings.json）
-        self.pause_lead_var = tk.StringVar()
-        self._load_pause_settings()
         if not self._is_admin:
             logger.warning(
                 "当前未以管理员运行：绑定 PC 客户端时自动暂停可能无效，"
@@ -197,12 +221,12 @@ class TimelineApp:
         # --- 窗口最小化（无边框 HUD） ---
         self._minimized = False
         self._restore_geometry = None
-        self._normal_alpha = config.DEFAULT_ALPHA
+        self._normal_alpha = self.settings["general"]["opacity"]
 
         # --- UI设置与启动 ---
         self._setup_styles()
         self._setup_ui()
-        self._setup_keybindings()
+        self._apply_global_settings(refresh_display=False)
         # 空白区域拖窗：bind_all + 命中过滤（ttk 空白区往往收不到自身绑定）
         self._window_dragging = False
         self.root.bind_all("<ButtonPress-1>", self._on_global_window_press, add="+")
@@ -220,7 +244,10 @@ class TimelineApp:
             self.add_track()
 
         # --- 启动后台服务与UI更新循环 ---
-        self.ws_client = WebsocketClient(config.WEBSOCKET_URI)
+        self.ws_client = WebsocketClient(
+            self.settings["ruler"]["websocket_uri"],
+            reconnect_delay=self.settings["ruler"]["reconnect_delay"],
+        )
         self.ws_client.start(self.ws_queue)
         self.root.after(config.QUEUE_POLL_INTERVAL, self._process_ws_queue)
         self.root.after(800, self._check_duplicate_rulers)
@@ -269,7 +296,8 @@ class TimelineApp:
         self.root.geometry(f"{self.scaled_win_width}x{self.scaled_win_height}+100+100")
         self.root.overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
-        self.root.wm_attributes("-alpha", config.DEFAULT_ALPHA)
+        opacity = get_setting(getattr(self, "settings", {}), "general.opacity", config.DEFAULT_ALPHA)
+        self.root.wm_attributes("-alpha", opacity)
 
     def _load_icons(self):
         """加载所有需要的图标文件。"""
@@ -398,6 +426,15 @@ class TimelineApp:
             self.top_save_btn.config(text="保存")
         SimpleTooltip(self.top_save_btn, text="保存时间轴文件")
         self.top_save_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
+
+        self.top_settings_btn = ttk.Button(
+            self.track_selector_frame,
+            text="设置",
+            command=self._open_settings_dialog,
+            style="Tool.TButton",
+        )
+        SimpleTooltip(self.top_settings_btn, text="全局设置")
+        self.top_settings_btn.pack(side=RIGHT, padx=self.scaled_pad_s)
 
         # --- 底部 resize handle（双横线，只调高度，禁止拖窗） ---
         # 注意：必须在 content_frame 之前 pack，否则 expand=True 的 content_frame
@@ -839,47 +876,117 @@ class TimelineApp:
     def _bound_window_path(self) -> str:
         return os.path.join(self._app_data_dir(), config.BOUND_WINDOW_FILE)
 
+    def _settings_path(self) -> str:
+        return os.path.join(self._app_data_dir(), "settings.json")
+
     def _pause_settings_path(self) -> str:
         name = getattr(config, "PAUSE_SETTINGS_FILE", "pause_settings.json")
         return os.path.join(self._app_data_dir(), name)
 
-    def _load_pause_settings(self) -> None:
-        """加载 pause_settings.json；缺省用 config.PAUSE_LEAD_FRAMES。"""
-        import json
+    def _save_global_settings(self) -> None:
+        """将应用级 Tk 变量同步到统一设置文件。"""
+        set_setting(self.settings, "alerts.sound_enabled", bool(self.sound_alert_enabled.get()))
+        set_setting(self.settings, "alerts.visual_enabled", bool(self.visual_alert_enabled.get()))
+        set_setting(self.settings, "alerts.alert_lead_frames", int(self.alert_lead_var.get()))
+        set_setting(self.settings, "alerts.pause_lead_frames", self._get_pause_lead_frames())
+        if not getattr(self, "_settings_was_missing", False):
+            self.settings = save_settings(self._settings_path(), self.settings)
 
-        default_lead = getattr(config, "PAUSE_LEAD_FRAMES", 1)
-        if default_lead is None:
-            default_lead = resolve_lead_frames(
-                lead_frames=None,
-                lead_ms=getattr(config, "PAUSE_LEAD_MS", 0),
-                logic_fps=getattr(config, "LOGIC_FPS", getattr(config, "FPS", 30)),
+    def _open_settings_dialog(self) -> None:
+        from settings_dialog import SettingsDialog
+
+        current = getattr(self, "_settings_dialog", None)
+        if current is not None:
+            try:
+                if current.window.winfo_exists():
+                    current.window.lift()
+                    current.window.focus_force()
+                    return
+            except TclError:
+                pass
+        self._settings_dialog = SettingsDialog(self.root, self.settings, self._on_settings_saved)
+
+    def _on_settings_saved(self, settings, restart_required=False) -> None:
+        self.settings = save_settings(self._settings_path(), settings)
+        self._settings_was_missing = False
+        self._auto_detect_adb_if_needed()
+        alerts = self.settings["alerts"]
+        self.sound_alert_enabled.set(alerts["sound_enabled"])
+        self.visual_alert_enabled.set(alerts["visual_enabled"])
+        self.alert_lead_var.set(str(alerts["alert_lead_frames"]))
+        self.pause_lead_var.set(str(alerts["pause_lead_frames"]))
+        self._apply_global_settings()
+        if restart_required:
+            messagebox.showinfo(
+                "设置已保存",
+                "费用尺连接设置将在重启打轴器后生效。",
+                parent=self.root,
             )
-        lead = int(default_lead or 0)
-        path = self._pause_settings_path()
-        try:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if "pause_lead_frames" in data:
-                    lead = max(0, int(data["pause_lead_frames"]))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("读取暂停设置失败: %s", e)
-        self.pause_lead_var.set(str(lead))
-        try:
-            self.pause_lead_var.trace_add("write", self._on_pause_lead_changed)
-        except Exception:  # noqa: BLE001
-            pass
 
-    def _save_pause_settings(self) -> None:
-        import json
+    def _setting(self, dotted_path, default=None):
+        return get_setting(getattr(self, "settings", {}), dotted_path, default)
 
-        path = self._pause_settings_path()
-        try:
-            lead = self._get_pause_lead_frames()
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"pause_lead_frames": lead}, f, ensure_ascii=False, indent=2)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("保存暂停设置失败: %s", e)
+    def _auto_detect_adb_if_needed(self) -> None:
+        emulator = self.settings.get("emulator", {})
+        if not emulator.get("auto_detect", True) or emulator.get("adb_path"):
+            return
+        candidates = candidate_adb_paths(user_dir=emulator.get("install_dir") or None)
+        result = detect_adb(candidates, selected_serial=emulator.get("serial") or None)
+        if not result.adb_path:
+            return
+        emulator["adb_path"] = result.adb_path
+        if not emulator.get("serial") and result.selected_serial:
+            emulator["serial"] = result.selected_serial
+        if not getattr(self, "_settings_was_missing", False):
+            self.settings = save_settings(self._settings_path(), self.settings)
+
+    def _apply_global_settings(self, *, refresh_display=True) -> None:
+        """立即应用不需要重启的设置。"""
+        timeline = self.settings["timeline"]
+        config.NODE_FIND_TOLERANCE = timeline["node_find_tolerance"]
+        config.NODE_CLICK_TOLERANCE = timeline["node_click_tolerance"]
+        config.KEYBOARD_SCROLL_STEP = timeline["keyboard_scroll_step"]
+        config.MOUSE_WHEEL_SCROLL_STEP = timeline["mouse_wheel_scroll_step"]
+
+        auto_pause = self.settings["auto_pause"]
+        config.PC_PAUSE_KEY_HOLD_MS = auto_pause["pc_key_hold_ms"]
+        config.FOCUS_GAME_BEFORE_SEND = auto_pause["focus_game_before_send"]
+        config.PAUSE_REQUIRE_ADMIN_FOR_PC = auto_pause["require_admin_for_pc"]
+
+        emulator = self.settings["emulator"]
+        config.ADB_PAUSE_ENABLED = emulator["enabled"]
+        config.ADB_SERIAL = emulator["serial"]
+        config.ADB_PREFER_FOR_EMULATOR = emulator["prefer_for_emulator"]
+
+        self._normal_alpha = self.settings["general"]["opacity"]
+        self.root.wm_attributes("-alpha", self._normal_alpha)
+        self._setup_keybindings()
+        if refresh_display:
+            self._update_display()
+
+    def _migrate_legacy_alerts_from_timeline(self, data) -> None:
+        """首次使用统一设置时，从旧时间轴第一轨迁移提醒选项。"""
+        if not self._settings_was_missing:
+            return
+        tracks = data.get("tracks", []) if isinstance(data, dict) else []
+        first = tracks[0] if tracks and isinstance(tracks[0], dict) else {}
+        mapping = {
+            "sound_alert_enabled": ("sound_alert_enabled", "sound_enabled"),
+            "visual_alert_enabled": ("visual_alert_enabled", "visual_enabled"),
+            "alert_lead_frames": ("alert_lead_var", "alert_lead_frames"),
+        }
+        migrated = False
+        for old_key, (var_name, new_key) in mapping.items():
+            if old_key not in first:
+                continue
+            value = first[old_key]
+            variable = getattr(self, var_name)
+            variable.set(str(value) if old_key == "alert_lead_frames" else bool(value))
+            set_setting(self.settings, f"alerts.{new_key}", value)
+            migrated = True
+        self._settings_was_missing = False
+        if migrated:
+            self._save_global_settings()
 
     def _get_pause_lead_frames(self) -> int:
         """UI 优先；解析失败回退 config。"""
@@ -894,14 +1001,6 @@ class TimelineApp:
             lead_ms=getattr(config, "PAUSE_LEAD_MS", 0),
             logic_fps=getattr(config, "LOGIC_FPS", getattr(config, "FPS", 30)),
         )
-
-    def _on_pause_lead_changed(self, *_args) -> None:
-        try:
-            lead = self._get_pause_lead_frames()
-            self._save_pause_settings()
-            self._set_pause_status(f"暂停提前: {lead} 帧")
-        except Exception:  # noqa: BLE001
-            pass
 
     def _set_pause_status(self, text: str) -> None:
         self._pause_status = text
@@ -1095,37 +1194,31 @@ class TimelineApp:
 
         method_used = None
         try:
-            if is_emu and getattr(config, "ADB_PREFER_FOR_EMULATOR", True):
-                method_used = send_adb_pause_key(getattr(config, "ADB_PAUSE_HOTKEY", "Space"))
+            emulator = self._setting("emulator", {})
+            if is_emu:
+                adb_enabled = emulator.get("enabled", getattr(config, "ADB_PAUSE_ENABLED", True))
+                use_adb = emulator.get(
+                    "prefer_for_emulator",
+                    getattr(config, "ADB_PREFER_FOR_EMULATOR", True),
+                )
+                if not adb_enabled or not use_adb:
+                    raise OSError("模拟器 ADB 自动暂停未启用")
+                method_used = send_adb_pause_tap(
+                    serial=emulator.get("serial") or None,
+                    adb_path=emulator.get("adb_path") or None,
+                    emulator_dir=emulator.get("install_dir") or None,
+                    enabled=True,
+                )
             else:
-                # PC 非管理员警告（文案为 ESC）
-                if (
-                    getattr(config, "PAUSE_REQUIRE_ADMIN_FOR_PC", True)
-                    and not self._is_admin
-                ):
-                    msg = "需管理员运行才能对 PC 客户端发暂停 ESC（右键 exe→以管理员身份运行）"
-                    self._set_pause_status(f"暂停: {msg}")
-                    if not self._admin_warned:
-                        self._admin_warned = True
-                        logger.warning("%s | 触发: %s", msg, summary)
-                        try:
-                            from tkinter import messagebox
-
-                            messagebox.showwarning(
-                                "自动暂停需要管理员",
-                                "已绑定 PC 游戏窗口，但 TimelineTool 未以管理员身份运行。\n\n"
-                                "ESC 暂停键很可能无法送达客户端（UAC 完整性隔离）。\n\n"
-                                "请：关闭本程序 → 右键 TimelineTool.exe →「以管理员身份运行」\n"
-                                "再重新绑定游戏窗后对轴。\n\n"
-                                "（若走模拟器 ADB，可不需要管理员。）",
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug("管理员提示框失败: %s", e)
                 method_used = send_pc_pause_key(
                     hwnd,
                     before_focus=self._drop_topmost_for_pause,
                     after_send=self._restore_topmost_for_pause,
-                    hold_ms=getattr(config, "PC_PAUSE_KEY_HOLD_MS", 50),
+                    hold_ms=self._setting("auto_pause.pc_key_hold_ms", getattr(config, "PC_PAUSE_KEY_HOLD_MS", 50)),
+                    focus_before_send=self._setting(
+                        "auto_pause.focus_game_before_send",
+                        getattr(config, "FOCUS_GAME_BEFORE_SEND", True),
+                    ),
                 )
         except Exception as e:  # noqa: BLE001
             # 输入 API 异常：pop 当前队首（当前组记失败，避免无限重试），不尝试其他通道
@@ -1160,11 +1253,10 @@ class TimelineApp:
             "trigger_frame": group.trigger_frame,
             "summary": summary,
         }
-        admin_tag = "" if self._is_admin else " [非管理员]"
         title_tag = ""
         if win and win.get("title"):
             title_tag = f" →{win['title'][:16]}"
-        self._set_pause_status(f"暂停校验 {method_used}{admin_tag}{title_tag}")
+        self._set_pause_status(f"暂停校验 {method_used}{title_tag}")
         logger.info(
             "自动暂停派发 trigger=%s current=%s pending=%d method=%s admin=%s: %s",
             group.trigger_frame,
@@ -1347,8 +1439,11 @@ class TimelineApp:
                 not bound.class_name or bound.class_name == "UnityWndClass"
             )
             if (
-                not is_emu
-                and getattr(config, "PAUSE_REQUIRE_ADMIN_FOR_PC", True)
+                is_maa_pc
+                and self._setting(
+                    "auto_pause.require_admin_for_pc",
+                    getattr(config, "PAUSE_REQUIRE_ADMIN_FOR_PC", True),
+                )
                 and not self._is_admin
             ):
                 self._set_pause_status(
@@ -1365,7 +1460,7 @@ class TimelineApp:
                         "建议以管理员运行",
                         f"已绑定：{bound.title}\n\n"
                         "这是 PC 游戏窗口。未以管理员身份运行时，\n"
-                        "自动暂停（Space）常常无法送达客户端。\n\n"
+                        "自动暂停（ESC）常常无法送达客户端。\n\n"
                         "请右键 TimelineTool.exe →「以管理员身份运行」后重试。\n"
                         "模拟器 + ADB 路径一般不需要管理员。",
                     )
@@ -1408,11 +1503,45 @@ class TimelineApp:
                 self.add_remove_btn._tooltip.set_text(text)
 
     def _setup_keybindings(self):
-        """绑定键盘事件：缩放与移动。"""
-        self.root.bind("<Up>", self._on_key_up)
-        self.root.bind("<Down>", self._on_key_down)
-        self.root.bind("<Left>", self._on_key_left)
-        self.root.bind("<Right>", self._on_key_right)
+        """按全局设置重新绑定窗口内快捷键。"""
+        for sequence in getattr(self, "_bound_shortcuts", []):
+            self.root.unbind(sequence)
+        configured = getattr(self, "settings", {}).get("shortcuts", DEFAULT_SHORTCUTS)
+        actions = {
+            "move_backward": self._on_key_left,
+            "move_forward": self._on_key_right,
+            "previous_node": self._on_ctrl_left,
+            "next_node": self._on_ctrl_right,
+            "zoom_track_in": self._shortcut_zoom_track_in,
+            "zoom_track_out": self._shortcut_zoom_track_out,
+            "zoom_all_in": self._shortcut_zoom_all_in,
+            "zoom_all_out": self._shortcut_zoom_all_out,
+        }
+        self._bound_shortcuts = []
+        for action, handler in actions.items():
+            sequence = configured.get(action, DEFAULT_SHORTCUTS[action])
+            self.root.bind(sequence, handler)
+            self._bound_shortcuts.append(sequence)
+
+    def _shortcut_zoom_track_in(self, _event=None):
+        if not self.is_time_flowing:
+            self._apply_track_zoom(0.1)
+        return "break"
+
+    def _shortcut_zoom_track_out(self, _event=None):
+        if not self.is_time_flowing:
+            self._apply_track_zoom(-0.1)
+        return "break"
+
+    def _shortcut_zoom_all_in(self, _event=None):
+        if not self.is_time_flowing:
+            self._apply_global_zoom(0.1)
+        return "break"
+
+    def _shortcut_zoom_all_out(self, _event=None):
+        if not self.is_time_flowing:
+            self._apply_global_zoom(-0.1)
+        return "break"
 
     def _on_key_up(self, event):
         """上箭头：单轨道缩放增大；Ctrl+上箭头：全局缩放增大。"""
@@ -1450,6 +1579,20 @@ class TimelineApp:
     def _on_key_right(self, event):
         """右箭头：向右移动一个逻辑帧。"""
         self._move_timeline_by_frames(config.KEYBOARD_SCROLL_STEP)
+
+    def _on_ctrl_left(self, event):
+        """Ctrl+左箭头：跳转到当前轨道的前一个节点。"""
+        active = self.active_track
+        if active:
+            active._on_prev_node_click(event)
+        return "break"
+
+    def _on_ctrl_right(self, event):
+        """Ctrl+右箭头：跳转到当前轨道的后一个节点。"""
+        active = self.active_track
+        if active:
+            active._on_next_node_click(event)
+        return "break"
 
     def _apply_global_zoom(self, delta):
         """统一调整所有轨道的缩放比例，使所有轨道倍率完全一致。"""
@@ -1587,68 +1730,12 @@ class TimelineApp:
         )
         self._create_track_pause_toggle(frame, 1, 1, active)
 
-    def _create_lead_controls(self, parent, active) -> None:
-        """提醒提前与暂停提前各占一行，避免窄操作面板横向截断。"""
-        alert_row = ttk.Frame(parent, style="TFrame")
-        alert_row.grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            alert_row,
-            text="提醒提前(帧):",
-            font=(config.FONT_FAMILY, self.scaled_font_normal),
-        ).pack(side=LEFT, padx=self.scaled_pad_m)
-        alert_spin = ttk.Spinbox(
-            alert_row,
-            from_=0,
-            to_=300,
-            textvariable=active.alert_lead_var,
-            width=5,
-        )
-        alert_spin.pack(side=LEFT, padx=self.scaled_pad_m)
-        alert_spin.bind("<Return>", lambda e: None)
-
-        pause_row = ttk.Frame(parent, style="TFrame")
-        pause_row.grid(row=1, column=0, sticky="w", pady=(self.scaled_pad_s, 0))
-        ttk.Label(
-            pause_row,
-            text="暂停提前(帧):",
-            font=(config.FONT_FAMILY, self.scaled_font_normal),
-        ).pack(side=LEFT, padx=self.scaled_pad_m)
-        pause_spin = ttk.Spinbox(
-            pause_row,
-            from_=0,
-            to_=30,
-            textvariable=self.pause_lead_var,
-            width=4,
-        )
-        pause_spin.pack(side=LEFT, padx=self.scaled_pad_m)
-        pause_spin.bind("<Return>", lambda e: self._on_pause_lead_changed())
-        pause_spin.bind("<FocusOut>", lambda e: self._on_pause_lead_changed())
-
     def _create_following_buttons(self):
         """为“对轴模式”创建操作按钮。"""
         frame = self.dynamic_ops_frame
         active = self.active_track
-        self._create_grid_toggle_button(
-            frame, 0, 0, "声音提醒: 开", "声音提醒: 关", active.sound_alert_enabled,
-            "sound_on", "sound_off",
-        )
-        self._create_grid_toggle_button(
-            frame, 0, 1, "视觉提醒: 开", "视觉提醒: 关", active.visual_alert_enabled,
-            "visual_on", "visual_off",
-        )
-        self._create_track_pause_toggle(frame, 0, 2, active)
-
-        self._create_grid_button(frame, 1, 0, "节点配置", "rename", active.configure_node_at_cursor)
-
-        lead_frame = ttk.Frame(frame, style="TFrame")
-        lead_frame.grid(
-            row=2,
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            pady=(self.scaled_pad_xl, 0),
-        )
-        self._create_lead_controls(lead_frame, active)
+        self._create_track_pause_toggle(frame, 0, 0, active)
+        self._create_grid_button(frame, 0, 1, "节点配置", "rename", active.configure_node_at_cursor)
 
     def _create_track_pause_toggle(self, parent, r, c, active):
         """轨道自动暂停总闸（对轴生效）。专用暂停图标，不用喇叭。"""
@@ -1920,6 +2007,7 @@ class TimelineApp:
 
     def _load_file_data(self, data, filepath):
         """加载时间轴数据并更新UI状态。"""
+        self._migrate_legacy_alerts_from_timeline(data)
         tracks_data = data.get("tracks", [])
         # 清除现有轨道
         if self._mode_trace_id:

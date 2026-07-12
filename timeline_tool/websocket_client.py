@@ -8,8 +8,9 @@ from config import WEBSOCKET_RECONNECT_DELAY
 logger = logging.getLogger(__name__)
 
 class WebsocketClient:
-    def __init__(self, uri):
+    def __init__(self, uri, reconnect_delay=WEBSOCKET_RECONNECT_DELAY):
         self.uri = uri
+        self.reconnect_delay = reconnect_delay
         self.ws_queue = None
 
     def start(self, ws_queue):
@@ -29,9 +30,9 @@ class WebsocketClient:
                         except json.JSONDecodeError:
                             logger.warning(f"收到无法解析的JSON消息: {message}")
             except (websockets.exceptions.ConnectionClosedError, OSError) as e:
-                logger.warning(f"WebSocket连接已关闭或失败: {e}。将在 {WEBSOCKET_RECONNECT_DELAY} 秒后重试...")
-                await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
+                logger.warning(f"WebSocket连接已关闭或失败: {e}。将在 {self.reconnect_delay} 秒后重试...")
+                await asyncio.sleep(self.reconnect_delay)
             except Exception as e:
                 logger.error(f"发生未知WebSocket错误: {e}")
-                await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
+                await asyncio.sleep(self.reconnect_delay)
 

@@ -8,7 +8,7 @@ PC 客户端：只使用 ESC + Windows SendInput。
     不会切换到其他输入 API（无窗口消息、无 keybd_event 暂停通道，
     Seize 中解除前台限制的 Alt tap 除外）。
 
-模拟器：保留显式 ADB Space 路径，不作为 PC 失败回退。
+模拟器：通过 ADB 点击游戏内暂停按钮，不作为 PC 失败回退。
 
 约束：
   - 不复制 AFA GPL 源码，不引入 AutoHotkey 运行时。
@@ -205,24 +205,29 @@ def _send_via_sendinput(
     one(KEYEVENTF_KEYUP, "up")
 
 
-def _try_adb_pause(hotkey: str) -> bool:
+def _try_adb_pause_tap(
+    *,
+    serial: Optional[str] = None,
+    adb_path: Optional[str] = None,
+    emulator_dir: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> Optional[Tuple[int, int]]:
     """显式 ADB 暂停路径（仅模拟器使用，不作为 PC 回退）。"""
     try:
         import config as _cfg
 
-        if not getattr(_cfg, "ADB_PAUSE_ENABLED", True):
-            return False
-        from adb_input import hotkey_to_keycode, send_keyevent
+        if enabled is None:
+            enabled = getattr(_cfg, "ADB_PAUSE_ENABLED", True)
+        if not enabled:
+            return None
+        from adb_input import send_pause_tap
 
-        serial = getattr(_cfg, "ADB_SERIAL", "") or None
-        keycode = getattr(_cfg, "ADB_KEYEVENT", None)
-        if keycode is None:
-            keycode = hotkey_to_keycode(hotkey)
-        send_keyevent(int(keycode), serial=serial or None)
-        return True
+        if serial is None:
+            serial = getattr(_cfg, "ADB_SERIAL", "") or None
+        return send_pause_tap(serial=serial, adb_path=adb_path, emulator_dir=emulator_dir)
     except Exception as e:  # noqa: BLE001
         logger.warning("ADB 暂停失败: %s", e)
-        return False
+        return None
 
 
 def is_elevated() -> bool:
@@ -241,6 +246,7 @@ def send_pc_pause_key(
     before_focus: Optional[Callable[[], None]] = None,
     after_send: Optional[Callable[[], None]] = None,
     hold_ms: int = 50,
+    focus_before_send: bool = True,
 ) -> str:
     """
     向 PC 游戏窗口发送一次 ESC + SendInput。
@@ -270,9 +276,10 @@ def send_pc_pause_key(
         already_foreground = foreground == int(hwnd)
         focused = already_foreground
         if not already_foreground:
-            focused = _try_foreground_seize(user32, wintypes, int(hwnd))
+            focused = focus_before_send and _try_foreground_seize(user32, wintypes, int(hwnd))
             if not focused:
-                raise OSError(f"无法将游戏窗口置前 hwnd={hwnd}；已取消发送 ESC")
+                reason = "未启用自动置前" if not focus_before_send else "无法将游戏窗口置前"
+                raise OSError(f"{reason} hwnd={hwnd}；已取消发送 ESC")
 
         vk = _vk("Escape")
         # VK 模式优先；返回 0 时在同一 PC 调用内改用 scancode 再试一次，
@@ -315,14 +322,30 @@ def send_pc_pause_key(
             after_send()
 
 
-def send_adb_pause_key(hotkey: str = "Space") -> str:
+def send_adb_pause_tap(
+    *,
+    serial: Optional[str] = None,
+    adb_path: Optional[str] = None,
+    emulator_dir: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> str:
     """
-    显式向模拟器发送一次 ADB 暂停键。
+    显式通过 ADB 点击一次模拟器内的暂停按钮。
 
-    只调用现有 ADB helper；失败抛 OSError，成功返回 "ADB(Space)"。
+    失败抛 OSError，成功返回包含实际坐标的方法描述。
     不作为 PC 失败回退。
     """
-    if not _try_adb_pause(hotkey):
-        raise OSError(f"ADB 暂停失败 hotkey={hotkey}")
-    logger.info("已发送模拟器自动暂停键 %s via ADB", hotkey)
-    return "ADB(Space)"
+    if serial is None and adb_path is None and emulator_dir is None and enabled is None:
+        point = _try_adb_pause_tap()
+    else:
+        point = _try_adb_pause_tap(
+            serial=serial,
+            adb_path=adb_path,
+            emulator_dir=emulator_dir,
+            enabled=enabled,
+        )
+    if point is None:
+        raise OSError("ADB 点击暂停失败")
+    x, y = point
+    logger.info("已点击模拟器暂停按钮 (%s,%s) via ADB", x, y)
+    return f"ADB(Tap {x},{y})"

@@ -1,7 +1,9 @@
 """节点菱形尺寸与抗锯齿渲染测试。"""
 import unittest
+from pathlib import Path
 
 import config
+import timeline_track
 from timeline_track import render_antialiased_diamond
 
 
@@ -22,6 +24,12 @@ class TestNodeRendering(unittest.TestCase):
         self.assertIn(0, alpha_values)
         self.assertIn(255, alpha_values)
         self.assertTrue(any(0 < value < 255 for value in alpha_values))
+
+    def test_timeline_no_longer_imports_portrait_manager(self):
+        """节点渲染只处理文字，不再加载干员头像资源。"""
+        self.assertFalse(hasattr(timeline_track, "OperatorPortraitManager"))
+        source = Path(timeline_track.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("portrait_mgr", source)
 
 
 if __name__ == "__main__":

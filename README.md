@@ -1,71 +1,131 @@
 # Arknights Timeline Tool
 
-一个配合明日方舟费用尺使用的独立打轴器。它会读取费用尺的实时帧数，帮助记录操作节点、对照时间轴，并在需要时自动暂停游戏。
+配合明日方舟费用尺使用的独立打轴器，可记录操作节点、对照时间轴，并按节点自动暂停游戏。
 
-本项目从 [duke4994/ArknightsCostBarRuler_-](https://github.com/duke4994/ArknightsCostBarRuler_-) 的 `timeline_tool` 分离而来。原项目已经提供多轨时间轴、节点提醒、干员头像和费用尺模拟器支持，改动如下
-
-- 独立发布打轴器，不再打包原费用尺。
-- 对接新版 Rust 费用尺。
-- 在对轴流程中加入自动暂停。
+本项目从 [duke4994/ArknightsCostBarRuler_-](https://github.com/duke4994/ArknightsCostBarRuler_-) 的 `timeline_tool` 分离而来。多轨时间轴、节点提醒和费用尺模拟器支持来自上游；本 Fork 增加了独立发布、新版 Rust 费用尺连接和自动暂停。
 
 ## 下载与启动
 
-1. 前往 [Releases](../../releases) 下载 `TimelineTool_vX.Y.Z_windows_x64.zip`。
-2. 解压整个压缩包，不要只取出其中的 EXE。头像、别名表等文件需要和程序放在同一目录。
-3. 启动新版 Rust 费用尺。本项目不附带费用尺，默认连接 `ws://127.0.0.1:2606`。
-4. 双击 `TimelineTool_YYYYMMDD.exe` 启动打轴器。
+1. 前往 [Releases](../../releases) 下载 Windows 压缩包并完整解压。
+2. 启动新版 Rust 费用尺。费用尺不包含在本项目中，默认地址为 `ws://127.0.0.1:2606`。
+3. 运行 `TimelineTool_YYYYMMDD.exe`。
 
-打轴器会自动连接费用尺。没有跟随帧数时，检查费用尺是否已启动，并确认本机只运行了一个费用尺实例。
+如果时间轴没有跟随帧数，请检查费用尺是否启动，并确认没有同时运行多个费用尺实例。
 
-## 打轴与对轴
+## 基本使用
 
-每条轨道都可以单独切换为「打轴模式」或「对轴模式」。
+每条轨道可以单独选择「打轴模式」或「对轴模式」。
 
-- 打轴时，把蓝色中心线移到需要记录的帧，添加节点，再填写名称和颜色。
-- 对轴时，轨道会跟随费用尺当前帧。节点接近时可以显示预告、播放提示音或进行视觉提醒。
-- 一个文件可以保存多条轨道，适合记录不同编队、不同思路，或把多个操作阶段放在一起对照。
+- 打轴模式：移动蓝色中心线，在需要记录的位置添加节点并填写名称。
+- 对轴模式：轨道跟随费用尺，接近节点时显示预告并发出提醒。
+- 磁铁开启时轨道跟随费用尺；关闭后可以自由查看其它位置。
 
-节点名称支持干员头像标记。例如输入 `[A41]开局部署`，会显示夜刀头像和后面的文字。干员别名可在 `timeline_tool/operator_aliases.xlsx` 中维护。
+常用操作：
 
-### 时间轴操作
+- `←`、`→` 或鼠标滚轮：移动 1 帧。
+- `Ctrl+←`、`Ctrl+→`：跳转到前一个、后一个节点。
+- `↑`、`↓`：缩放当前轨道。
+- `Ctrl+↑`、`Ctrl+↓`：缩放全部轨道。
 
-- 开启磁铁时，蓝色中心线跟随费用尺；关闭后可以自由查看其它位置。
-- `←`、`→` 每次移动 1 帧，方便微调。
-- 鼠标停在轨道上滚动滚轮，每格移动 10 帧。
-- 费用尺正在计时时，对轴轨道会保持跟随，避免误拖离当前时间。
-- 顶栏可以新建、删除和切换轨道；在顶栏空白处拖动可移动窗口。底部和右侧把手分别调整高度、宽度。
+单击节点前后 3 帧会吸附到该节点，中心线在节点前后 3 帧内时可以选中并编辑。吸附范围、选中范围和移动步数都能在设置中修改。
+
+## 设置
+
+点击顶栏「设置」可以调整透明度、提醒、时间轴操作、快捷键、费用尺、自动暂停和模拟器连接。
+
+声音提醒、视觉提醒、提醒提前帧数和暂停提前帧数是全局设置，对所有轨道生效。快捷键点击后直接按键录入，重复的快捷键无法保存。
+
+费用尺地址和重连间隔在重启后生效，其余设置保存后立即生效。
 
 ## 自动暂停
 
-自动暂停只在「对轴模式」下生效。
+打轴和对轴模式都可以启用自动暂停：
 
-1. 在左侧操作面板打开轨道的「轨暂停」。
-2. 在节点配置中确认「到点自动暂停」已开启。
-3. 点击「绑定游戏窗」，在倒计时结束前把鼠标移到目标游戏窗口。
-4. 设置「暂停提前（帧）」后开始对轴。到达节点前，打轴器会按设置提前暂停。
+1. 打开轨道的「轨暂停」。
+2. 选中暂停节点，在节点配置中打开「到点自动暂停」。
+3. 点击「绑定游戏窗」，将鼠标移到游戏窗口。
+4. 在「设置 → 提醒」中调整暂停提前帧数。
 
-同一帧的多个节点只暂停一次；不同帧的节点会在每次恢复游戏后依次暂停。
+轨道开关和节点开关需要同时开启。暂停提前默认是 1 帧。
 
-使用 PC 客户端自动暂停时，必须右键 `TimelineTool_YYYYMMDD.exe`，选择「以管理员身份运行」。否则系统可能拦截暂停输入。模拟器自动暂停通常不需要管理员权限；多开模拟器时，请在 `timeline_tool/config.py` 中填写正确的 `ADB_SERIAL`。
+发送输入、游戏响应和费用尺读取都有延迟，实际停帧可能存在误差。相距 5 帧以内的连续暂停点容易漏掉后一个节点。
+
+> **请根据电脑延迟留出足够的提前量，并配合 AFA 或「划火柴」等工具精确过帧。不要把自动暂停节点设置得太近。**
+
+推荐使用两条轨道：一条只放自动暂停节点，另一条记录完整操作和提醒节点。
+
+PC 客户端启用自动暂停时，需要以管理员身份运行打轴器。
+
+MuMu、雷电等模拟器不需要管理员权限，但需要开启 ADB。模拟器分辨率需为不低于 `1280×720` 的 `16:9`；ADB 可以自动探测，也可以在「设置 → 模拟器」中指定模拟器目录或 `adb.exe`。检测到多台设备时需要手动选择。
 
 ## 保存与导入
 
-顶栏右侧提供打开和保存按钮，用于读写整份时间轴 JSON 文件。
+顶栏的打开和保存按钮用于读写整份时间轴 JSON 文件。
 
-`小工具/` 目录提供 JSON 与 Excel 的互转工具，适合批量修改节点名称和帧数：
+`小工具/` 提供两项转换工具：
 
-- `json_to_excel.py`：把时间轴 JSON 转成 Excel。
-- `excel_to_json.py`：把编辑后的 Excel 转回时间轴 JSON。
+- `json_to_excel.py`：把时间轴转成 Excel。
+- `excel_to_json.py`：把 Excel 转回时间轴。
+
+## 编译与开发
+
+项目使用 uv 管理 Python 环境：
+
+```powershell
+uv venv
+uv pip install -r requirements.txt
+.\.venv\Scripts\python.exe timeline_tool\main.py
+```
+
+运行测试：
+
+```powershell
+cd timeline_tool
+..\.venv\Scripts\python.exe -m unittest discover -p "test_*.py" -v
+```
+
+生成 Windows EXE：
+
+```powershell
+.\.venv\Scripts\python.exe build.py
+```
+
+费用尺需要单独启动，不会被打包进 EXE。
+
+## 更新日志
+
+### v2.5.0（2026-07-13）
+
+- 新增统一设置窗口，提醒、暂停提前量、时间轴操作和快捷键改为全局配置。
+- 快捷键支持直接按键录入。
+- 增加模拟器与 ADB 自动探测、设备选择和连接测试。
+- 调整自动暂停、节点吸附、逐帧移动和节点跳转。
+- 移除未使用的头像功能和资源。
+
+### v2.4.0（2026-07-11）
+
+- 提供独立 Windows 发行包，补充 EXE 使用说明。
+
+### v2.3（2026-06-21）
+
+- 修复进度跳回 0 的问题，减少无效日志。
+
+### v2.2（2026-06-21）
+
+- 优化磁铁吸附，并修复进度异常。
+
+### v2.1（2026-06-06）
+
+- 补充多轨时间轴和节点提醒的使用说明。
 
 ## 开源协议与鸣谢
 
-本项目以 [MIT License](LICENSE) 开源，保留上游和第三方依赖的许可证文件，详见 `LICENSES/`。
+本项目使用 [MIT License](LICENSE)，第三方许可证见 `LICENSES/`。欢迎提交 Issue 和 Pull Request。
 
-感谢以下项目和贡献者：
+感谢以下项目：
 
-- [duke4994/ArknightsCostBarRuler_-](https://github.com/duke4994/ArknightsCostBarRuler_-)：本项目的直接上游。
-- [ZeroAd-06/ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler)：上游项目的基础版本。
-- [MaaFramework](https://github.com/MaaXYZ/MaaFramework)：窗口识别策略的参考来源。
-- [Minicap](https://github.com/DeviceFarmer/minicap) 与 [Google Material Symbols](https://fonts.google.com/icons)：上游保留的资源和许可证说明。
-
-欢迎提交 Issue、PR 和使用反馈。提交代码前请运行完整测试，并说明改动影响的功能范围。
+- [duke4994/ArknightsCostBarRuler_-](https://github.com/duke4994/ArknightsCostBarRuler_-)
+- [ZeroAd-06/ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler)
+- [MaaFramework](https://github.com/MaaXYZ/MaaFramework)
+- [Minicap](https://github.com/DeviceFarmer/minicap)
+- [Google Material Symbols](https://fonts.google.com/icons)

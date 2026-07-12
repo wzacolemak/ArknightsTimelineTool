@@ -5,6 +5,8 @@ __pycache__/
 venv/
 logs/
 bound_game_window.json
+settings.json
+pause_settings.json
 *.log
 .idea/
 .vscode/

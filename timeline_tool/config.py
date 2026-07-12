@@ -1,5 +1,5 @@
 # --- 项目信息 ---
-VERSION = "TimelineTool_独立版_20260711"
+VERSION = "TimelineTool v2.5.0"
 
 # --- 应用设置 ---
 FPS = 30
@@ -20,8 +20,8 @@ NODE_LABEL_MIN_GAP = 4
 # --- 时间轴与节点 ---
 PIXELS_PER_FRAME = 2            # 每个逻辑帧在时间轴上占用的像素
 
-NODE_FIND_TOLERANCE = 3         # 光标附近查找节点的容差（帧）
-NODE_CLICK_TOLERANCE = 15       # 点击节点的容差范围（帧），比查找范围大更易于点击
+NODE_FIND_TOLERANCE = 3         # 节点选中/编辑允许前后 3 帧范围
+NODE_CLICK_TOLERANCE = 3        # 单击节点前后 3 帧范围可吸附
 NODE_DIAMOND_SIZE = {"h": 6, "w": 3.5} # 略小的抗锯齿节点菱形半高/半宽
 NODE_OUTLINE_COLOR = "#FFFFFF"  # 节点默认轮廓颜色
 NODE_SELECTED_OUTLINE_COLOR = "#00FFFF" # 选中时节点的高亮轮廓颜色
@@ -35,7 +35,7 @@ DRAG_START_THRESHOLD = 5          # 拖动超过多少像素才算开始拖拽
 MIN_ZOOM = 0.2                  # 最小缩放比例
 MAX_ZOOM = 5.0                  # 最大缩放比例
 KEYBOARD_SCROLL_STEP = 1        # 键盘左右键细调：每次移动 1 逻辑帧
-MOUSE_WHEEL_SCROLL_STEP = 10    # 轨道滚轮粗调：每格移动 10 逻辑帧
+MOUSE_WHEEL_SCROLL_STEP = 1     # 轨道滚轮细调：每格移动 1 逻辑帧
 
 # --- 时间轴视觉 ---
 TIMELINE_TRACK_COLOR = "#2c313a" # 时间轴轨道的背景色
@@ -69,7 +69,7 @@ TOOL_BUTTON_PADDING = 0
 
 # --- 紧凑级别阈值（基于单个轨道 frame 高度，乘以缩放因子后的像素值） ---
 COMPACT_LEVEL_1_THRESHOLD = 105  # 隐藏时间轴上方时间文字
-COMPACT_LEVEL_2_THRESHOLD = 85   # 隐藏时间轴下方节点名称，info_name 支持头像
+COMPACT_LEVEL_2_THRESHOLD = 85   # 隐藏时间轴下方节点名称
 COMPACT_LEVEL_3_THRESHOLD = 70   # 减小菱形高度
 COMPACT_DIAMOND_SCALE = 0.5      # 阶段3菱形缩放比例
 
@@ -115,12 +115,10 @@ GAME_WINDOW_TITLE_KEYWORDS = [
 BOUND_WINDOW_FILE = "bound_game_window.json"  # 相对项目根 / exe 同级
 
 # --- ADB 暂停（MuMu / 雷电等模拟器的独立路径，不是 PC 失败回退）---
-# 模拟器通过 adb shell input keyevent 发送 Space。该路径与 PC ESC + SendInput
-# 完全独立：PC 路径失败不会自动改走 ADB。
-ADB_PAUSE_HOTKEY = "Space"   # 模拟器暂停键
+# 模拟器通过 adb shell input tap 点击游戏内暂停按钮。该路径与 PC ESC +
+# SendInput 完全独立：PC 路径失败不会自动改走 ADB。
 ADB_PAUSE_ENABLED = True
 ADB_SERIAL = ""              # 空=自动选第一台 device；可填 127.0.0.1:16384 等
-ADB_KEYEVENT = 62            # KEYCODE_SPACE；也可被 ADB_PAUSE_HOTKEY 映射覆盖
 # 绑定窗标题含模拟器关键字时优先走 ADB
 ADB_PREFER_FOR_EMULATOR = True
 

@@ -194,7 +194,7 @@ class TestPauseAppFlow(unittest.TestCase):
 
         with patch.object(app, "_resolve_live_game_window", return_value=win), \
              patch("app.send_pc_pause_key", side_effect=OSError("boom")) as mock_pc, \
-             patch("app.send_adb_pause_key") as mock_adb, \
+             patch("app.send_adb_pause_tap") as mock_adb, \
              patch("app.looks_like_emulator_window", return_value=False):
             ok = app._dispatch_next_pause_group(current_frame=59)
 
@@ -294,7 +294,7 @@ class TestPauseAppFlow(unittest.TestCase):
             "summary": "x",
         }
         with patch("app.send_pc_pause_key") as mock_pc, \
-             patch("app.send_adb_pause_key") as mock_adb:
+             patch("app.send_adb_pause_tap") as mock_adb:
             app._mark_pause_failed(current_frame=59, reason="stall_timeout")
         # 清 gate/verify/active
         self.assertIsNone(app._pause_gate)
@@ -310,8 +310,8 @@ class TestPauseAppFlow(unittest.TestCase):
     def test_old_pause_symbols_removed_from_app(self):
         """旧符号必须以独立 token 形式从 app.py 删除。
 
-        用词边界正则，避免把新符号 ``send_adb_pause_key`` / ``send_pc_pause_key``
-        / ``ADB_PAUSE_HOTKEY`` / ``PC_PAUSE_HOTKEY`` 误判为旧符号。
+        用词边界正则，避免把新符号 ``send_adb_pause_tap`` / ``send_pc_pause_key``
+        / ``PC_PAUSE_HOTKEY`` 误判为旧符号。
         """
         import inspect
         import re
@@ -323,11 +323,11 @@ class TestPauseAppFlow(unittest.TestCase):
             r"\b_send_pause_via_method\b",
             r"\b_fail_current_pause_method\b",
             # 旧 send_pause_key 必须不是独立符号；
-            # 新 send_adb_pause_key / send_pc_pause_key 允许（用左词边界 + 左非字母数字下划线）
+            # 新 send_adb_pause_tap / send_pc_pause_key 允许（用左词边界 + 左非字母数字下划线）
             r"(?<![A-Za-z0-9_])send_pause_key\b",
             r"\bPAUSE_PC_METHODS\b",
             r"\bforce_method\b",
-            # 旧 PAUSE_HOTKEY 必须不是独立符号；新 ADB_PAUSE_HOTKEY / PC_PAUSE_HOTKEY 允许
+            # 旧 PAUSE_HOTKEY 必须不是独立符号；新 PC_PAUSE_HOTKEY 允许
             r"(?<![A-Za-z0-9_])PAUSE_HOTKEY\b",
             r"\bPAUSE_COOLDOWN_SEC\b",
             r"\bawait_freeze\b",
@@ -482,7 +482,7 @@ class TestPauseAppFlow(unittest.TestCase):
         self.assertEqual(app.root.after.call_count, 1)
 
     # ------------------------------------------------------------------
-    # M1 正向：模拟器窗口 → send_adb_pause_key 一次，不调 PC，进入 verifying
+    # M1 正向：模拟器窗口 → send_adb_pause_tap 一次，不调 PC，进入 verifying
     # ------------------------------------------------------------------
     def test_emulator_window_dispatches_adb_not_pc(self):
         app = make_app()
@@ -490,7 +490,7 @@ class TestPauseAppFlow(unittest.TestCase):
         group = app._pending_pause_groups.peek()
         win = {"hwnd": 42, "title": "MuMu模拟器", "class_name": "Qt5152QWindowOwnDC"}
         with patch.object(app, "_resolve_live_game_window", return_value=win), \
-             patch("app.send_adb_pause_key", return_value="ADB(Space)") as mock_adb, \
+             patch("app.send_adb_pause_tap", return_value="ADB(Tap 1200,50)") as mock_adb, \
              patch("app.send_pc_pause_key") as mock_pc, \
              patch("app.looks_like_emulator_window", return_value=True):
             ok = app._dispatch_next_pause_group(current_frame=59)
@@ -501,6 +501,95 @@ class TestPauseAppFlow(unittest.TestCase):
         self.assertEqual(app._pause_gate, "verifying")
         self.assertIs(app._active_pause_group, group)
         self.assertEqual(len(app._pending_pause_groups), 0)
+
+    def test_disabled_emulator_adb_never_falls_back_to_pc_escape(self):
+        app = make_app()
+        app.settings = {"emulator": {"enabled": False, "prefer_for_emulator": True}}
+        app._queue_pause_events([make_event(0, 60, 59, "A")])
+        win = {"hwnd": 42, "title": "MuMu模拟器", "class_name": "Qt5152QWindowOwnDC"}
+        with patch.object(app, "_resolve_live_game_window", return_value=win), \
+             patch("app.send_adb_pause_tap") as mock_adb, \
+             patch("app.send_pc_pause_key") as mock_pc, \
+             patch("app.looks_like_emulator_window", return_value=True):
+            ok = app._dispatch_next_pause_group(current_frame=59)
+
+        self.assertFalse(ok)
+        mock_adb.assert_not_called()
+        mock_pc.assert_not_called()
+
+    def test_non_admin_pc_dispatch_does_not_warn_or_report_admin_status(self):
+        app = make_app()
+        app._is_admin = False
+        app._set_pause_status = MagicMock()
+        app._queue_pause_events([make_event(0, 60, 59, "A")])
+        win = {"hwnd": 1, "title": "明日方舟", "class_name": "UnityWndClass"}
+
+        with patch.object(app, "_resolve_live_game_window", return_value=win), \
+             patch("app.send_pc_pause_key", return_value="SendInput(Escape)"), \
+             patch("app.looks_like_emulator_window", return_value=False), \
+             patch("tkinter.messagebox.showwarning") as warning:
+            ok = app._dispatch_next_pause_group(current_frame=59)
+
+        self.assertTrue(ok)
+        warning.assert_not_called()
+        status_texts = [str(args[0]) for args, _kwargs in app._set_pause_status.call_args_list]
+        self.assertFalse(any("管理员" in text or "非管理员" in text for text in status_texts))
+
+    def test_binding_non_admin_pc_warns_once_and_mentions_escape(self):
+        app = make_app()
+        app._is_admin = False
+        app.root = MagicMock()
+        app._set_pause_status = MagicMock()
+        win = {
+            "hwnd": 1,
+            "title": "明日方舟",
+            "class_name": "UnityWndClass",
+            "pid": 10,
+            "width": 1280,
+            "height": 720,
+        }
+
+        with patch.object(app, "_bound_window_path", return_value="bound.json"), \
+             patch("app.pick_window_under_cursor", return_value=win), \
+             patch("game_window.window_from_point", return_value=win), \
+             patch("app.save_bound"), \
+             patch("tkinter.messagebox.showwarning") as warning:
+            app._bind_game_window_click()
+            finish = app.root.after.call_args.args[1]
+            finish()
+
+        warning.assert_called_once()
+        title, message = warning.call_args.args
+        self.assertIn("管理员", title)
+        self.assertIn("ESC", message)
+        self.assertNotIn("Space", message)
+
+    def test_binding_emulator_does_not_show_admin_warning(self):
+        app = make_app()
+        app._is_admin = False
+        app.root = MagicMock()
+        app._set_pause_status = MagicMock()
+        win = {
+            "hwnd": 2,
+            "title": "雷电模拟器",
+            "class_name": "LDPlayerMainFrame",
+            "pid": 20,
+            "width": 1280,
+            "height": 720,
+        }
+
+        with patch.object(app, "_bound_window_path", return_value="bound.json"), \
+             patch("app.pick_window_under_cursor", return_value=win), \
+             patch("game_window.window_from_point", return_value=win), \
+             patch("app.save_bound"), \
+             patch("tkinter.messagebox.showwarning") as warning:
+            app._bind_game_window_click()
+            finish = app.root.after.call_args.args[1]
+            finish()
+
+        warning.assert_not_called()
+        statuses = [str(args[0]) for args, _kwargs in app._set_pause_status.call_args_list]
+        self.assertTrue(any("模拟器" in text for text in statuses))
 
     def test_move_timeline_by_one_frame_breaks_track_magnet(self):
         """键盘/滚轮移动应按传入帧数移动，并解除目标轨道磁铁。"""
@@ -519,6 +608,40 @@ class TestPauseAppFlow(unittest.TestCase):
         self.assertEqual(app.timeline_offset, 11.0)
         self.assertFalse(magnet_state["value"])
         app._update_display.assert_called_once()
+
+    def test_ctrl_left_jumps_to_previous_node_on_active_track(self):
+        app = make_app()
+        track = MagicMock()
+        app.tracks = [track]
+        app.active_track_index = 0
+        event = SimpleNamespace(state=0x0004)
+
+        result = app._on_ctrl_left(event)
+
+        track._on_prev_node_click.assert_called_once_with(event)
+        self.assertEqual(result, "break")
+
+    def test_ctrl_right_jumps_to_next_node_on_active_track(self):
+        app = make_app()
+        track = MagicMock()
+        app.tracks = [track]
+        app.active_track_index = 0
+        event = SimpleNamespace(state=0x0004)
+
+        result = app._on_ctrl_right(event)
+
+        track._on_next_node_click.assert_called_once_with(event)
+        self.assertEqual(result, "break")
+
+    def test_setup_keybindings_registers_ctrl_node_jumps(self):
+        app = make_app()
+        app.root = MagicMock()
+
+        app._setup_keybindings()
+
+        sequences = [args[0] for args, _kwargs in app.root.bind.call_args_list]
+        self.assertIn("<Control-Left>", sequences)
+        self.assertIn("<Control-Right>", sequences)
 
     def test_window_drag_is_limited_to_explicit_drag_zones(self):
         """普通标签不应拖动 HUD；顶栏标记区中的空白仍可拖动。"""
@@ -551,38 +674,10 @@ class TestPauseAppFlow(unittest.TestCase):
         app._set_pause_status.assert_called_with("费用尺多开: 2 个进程")
         self.assertEqual(app.root.after.call_count, 2)
 
-    def test_lead_controls_are_stacked_in_two_rows(self):
-        """提醒提前与暂停提前应各占一行，窄操作面板也能完整显示。"""
+    def test_per_track_lead_controls_are_removed(self):
+        """提醒与暂停提前量改为全局设置后，操作面板不再提供单轨输入框。"""
         from app import TimelineApp
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = TimelineApp.__new__(TimelineApp)
-            app.scaled_pad_m = 3
-            app.scaled_pad_s = 2
-            app.scaled_font_normal = -9
-            app.pause_lead_var = tk.StringVar(root, value="1")
-            app._on_pause_lead_changed = MagicMock()
-            active = SimpleNamespace(alert_lead_var=tk.StringVar(root, value="60"))
-            parent = ttk.Frame(root)
-
-            app._create_lead_controls(parent, active)
-            root.update_idletasks()
-
-            rows = parent.winfo_children()
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(int(rows[0].grid_info()["row"]), 0)
-            self.assertEqual(int(rows[1].grid_info()["row"]), 1)
-            labels = [
-                child.cget("text")
-                for row in rows
-                for child in row.winfo_children()
-                if isinstance(child, ttk.Label)
-            ]
-            self.assertEqual(labels, ["提醒提前(帧):", "暂停提前(帧):"])
-        finally:
-            root.destroy()
+        self.assertFalse(hasattr(TimelineApp, "_create_lead_controls"))
 
 
 if __name__ == "__main__":

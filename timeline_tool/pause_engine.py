@@ -138,8 +138,6 @@ class PauseEngine:
 
         for t_idx, track in enumerate(tracks):
             track_dict = self._track_as_dict(track)
-            if not is_replay_mode(track_dict.get("mode")):
-                continue
             if not _truthy(track_dict.get("pause_enabled"), True):
                 continue
             track_name = track_dict.get("name", f"轨道{t_idx}")

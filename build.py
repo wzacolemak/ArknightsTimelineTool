@@ -110,21 +110,23 @@ def copy_extra_files(target_dir: str) -> None:
         shutil.copy(readme_src, os.path.join(target_dir, "README.md"))
         files_copied.append("README.md")
 
-    for fname in ("operator_aliases.xlsx", "naming_config.json"):
+    for fname in ("naming_config.json",):
         src = os.path.join(TIMELINE_DIR, fname)
         if os.path.exists(src):
             shutil.copy(src, os.path.join(target_dir, fname))
             files_copied.append(fname)
 
-    portraits_src = os.path.join(TIMELINE_DIR, "operator_portraits")
-    if os.path.exists(portraits_src):
-        portraits_dst = os.path.join(target_dir, "operator_portraits")
-        if os.path.exists(portraits_dst):
-            shutil.rmtree(portraits_dst)
-        shutil.copytree(portraits_src, portraits_dst)
-        files_copied.append("operator_portraits/")
-
     print(f"  已复制外部资源: {', '.join(files_copied) if files_copied else '(无)'}")
+
+
+def copy_convenience_exe(source: str, destination: str) -> bool:
+    """复制根目录快捷 EXE；文件被运行中的程序锁定时不阻断发行构建。"""
+    try:
+        shutil.copy(source, destination)
+        return True
+    except PermissionError:
+        print(f"[警告] 无法覆盖正在使用的 {destination}，发行目录中的 EXE 已正常生成。")
+        return False
 
 
 def main() -> None:
@@ -144,9 +146,11 @@ def main() -> None:
     if os.path.exists(src_exe):
         shutil.move(src_exe, dst_exe)
         # 根目录也放一份固定名，方便双击
-        shutil.copy(dst_exe, os.path.join(BASE_DIR, "TimelineTool.exe"))
+        convenience_exe = os.path.join(BASE_DIR, "TimelineTool.exe")
+        copied = copy_convenience_exe(dst_exe, convenience_exe)
         print(f"  已输出: {dst_exe}")
-        print(f"  已复制: {os.path.join(BASE_DIR, 'TimelineTool.exe')}")
+        if copied:
+            print(f"  已复制: {convenience_exe}")
 
     build_tools(version_dir)
     copy_extra_files(version_dir)

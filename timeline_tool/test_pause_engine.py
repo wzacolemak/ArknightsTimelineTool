@@ -81,7 +81,7 @@ class TestPauseEngine(unittest.TestCase):
         self.assertEqual(resolve_lead_frames(lead_frames=None, lead_ms=100, logic_fps=30), 3)
         self.assertEqual(resolve_lead_frames(lead_frames=-1), 0)
 
-    def test_chart_mode_ignored(self):
+    def test_editing_mode_can_pause(self):
         eng = PauseEngine()
         tracks = [
             {
@@ -91,7 +91,9 @@ class TestPauseEngine(unittest.TestCase):
             }
         ]
         eng.tick(0, tracks)
-        self.assertEqual(eng.tick(20, tracks), [])
+        events = eng.tick(20, tracks)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["frame"], 10)
 
     def test_pause_flags(self):
         eng = PauseEngine()
@@ -181,9 +183,9 @@ class TestPauseEngine(unittest.TestCase):
         """左右键用于细调，每次只移动一个逻辑帧。"""
         self.assertEqual(config.KEYBOARD_SCROLL_STEP, 1)
 
-    def test_mouse_wheel_scroll_step_is_ten_logical_frames(self):
-        """轨道滚轮用于粗调，每格移动十个逻辑帧。"""
-        self.assertEqual(config.MOUSE_WHEEL_SCROLL_STEP, 10)
+    def test_mouse_wheel_scroll_step_is_one_logical_frame(self):
+        """轨道滚轮用于逐帧微调，每格移动一个逻辑帧。"""
+        self.assertEqual(config.MOUSE_WHEEL_SCROLL_STEP, 1)
 
     def test_old_pause_symbols_absent(self):
         """清除：旧暂停通道/冷却/多通道配置符号不得残留。"""
