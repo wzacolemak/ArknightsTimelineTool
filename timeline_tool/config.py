@@ -1,5 +1,5 @@
 # --- 项目信息 ---
-VERSION = "TimelineTool v2.5.0"
+VERSION = "TimelineTool v0.0.1 测试版"
 
 # --- 应用设置 ---
 FPS = 30
